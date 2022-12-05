@@ -21,5 +21,5 @@ jaxlib>=0.3.22+cuda11
 git+git://github.com/deepmind/jraph.git@51f5990104f7374492f8f3ea1cbc47feb411c69c
 graphviz>=0.20.1
 # python_graphs
-git+git://github.com/google-research/python-graphs.git@51f5990104f7374492f8f3ea1cbc47feb411c69c
+git+git://github.com/google-research/python-graphs.git@0201fb090b9224dfb1a9a05ce836e9ef6da8ccc9
 tbb>=2021.7.0

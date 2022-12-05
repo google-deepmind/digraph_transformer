@@ -16,6 +16,12 @@ pip3 install --upgrade pip setuptools wheel
 pip3 install -r requirements.txt
 ```
 
+Note that you will also need the headers of libtbb and graphviz:
+
+```
+sudo apt install libtbb-dev graphviz-dev
+```
+
 ## Sorting Networks
 
 We now explain how to reproduce the results using the transformer with magnetic
