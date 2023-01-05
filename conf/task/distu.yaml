@@ -1,0 +1,16 @@
+# @package _global_
+
+config:
+  task: distu
+  data: ./data/distance
+  wandb:
+    project: digt-playground
+    settings:
+      code_dir: .
+
+overwrite:
+  experiment_kwargs:
+    config:
+      model:
+        gnn_config:
+          se: ~

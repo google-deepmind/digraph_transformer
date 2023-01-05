@@ -22,3 +22,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Data
+data/
+wandb/
+multirun/
+outputs/
+assets/

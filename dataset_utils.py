@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from absl import logging
 import jax
+import jax.numpy as jnp
 import jraph
 import numba
 import numpy as np
@@ -50,11 +51,10 @@ def _add_target_to_globals(dataset_config: config.Dataset,
                            graph: jraph.GraphsTuple, target: tf.Tensor,
                            target_raw: Optional[tf.Tensor],
                            graph_index: Optional[int], is_training: bool):
-  """Adds the labels to globals of the graph for conveience."""
-
-  # Important that shapes are known for tensorflow batching.
-
+  """Adds the labels to globals of the graph for convenience."""
   def set_global_shape(x):
+    if dataset_config.sequence_length < 0:
+      return x
     return tf.ensure_shape(x, [1, dataset_config.sequence_length])
 
   globals_dict = {
@@ -69,7 +69,8 @@ def _add_target_to_globals(dataset_config: config.Dataset,
   return graph._replace(globals=globals_dict)
 
 
-def _pad_to_next_power_of_two(graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
+def _pad_to_next_power_of_two(graph: jraph.GraphsTuple,
+                              cfg: config.Dataset) -> jraph.GraphsTuple:
   """Pads GraphsTuple nodes and edges to next power of two."""
   graph = _make_writable(graph)
 
@@ -97,9 +98,52 @@ def _pad_to_next_power_of_two(graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
     padded = np.concatenate([leaf, padding], axis=1)
     return padded
 
-  tree_nodes_pad = functools.partial(pad, n_pad=pad_n_node)
-  tree_edges_pad = functools.partial(pad, n_pad=pad_n_edge)
-  tree_globs_pad = functools.partial(pad, n_pad=pad_n_empty_graph)
+  if cfg.name.startswith('dist'):
+    tree_nodes_pad = functools.partial(pad, n_pad=int(n_node))
+    tree_edges_pad = functools.partial(pad, n_pad=int(n_edge))
+
+    def tree_globs_pad(globals_):
+      if globals_.shape[-1] == 1:
+        return pad(globals_, n_pad=pad_n_empty_graph)
+
+      indices = jnp.tile(jnp.arange(n_node), (batch, 1))
+      padding_mask = indices < graph.n_node[:, 0, None]
+      padding_mask = padding_mask[:, :, None] * padding_mask[:, None, :]
+
+      if cfg.num_classes > 0 and not cfg.name.endswith('con'):
+        # adj = np.zeros((batch, int(n_node), int(n_node)), dtype=np.int32)
+        adj = np.full((batch, int(n_node), int(n_node)), -1, dtype=np.int32)
+
+        adj[padding_mask] = 0
+
+        batch_idx = np.arange(batch)[:, None]
+        batch_idx = np.tile(batch_idx, (1, graph.senders.shape[-1]))
+        adj[batch_idx, graph.senders, graph.receivers] = 1
+
+        adj[:, jnp.arange(int(n_node)), jnp.arange(int(n_node))] = -1
+        return adj
+      else:
+        sq_globals = np.full((batch, int(n_node), int(n_node)), -1.)
+
+        for idx_batch, nb_nodes in enumerate(graph.n_node[:, 0]):
+          idx = np.arange(nb_nodes)
+          idx = np.stack(np.meshgrid(idx, idx)).reshape((2, -1))
+          sq_globals[idx_batch, idx[0], idx[1]] = globals_[
+              idx_batch, 0, :int(nb_nodes ** 2)]
+
+        sq_globals[:, np.arange(int(n_node)), np.arange(int(n_node))] = -1
+        if cfg.name.endswith('con'):
+          sq_globals[~np.isfinite(sq_globals)] = 0
+          sq_globals[sq_globals > 0] = 1
+        else:
+          sq_globals[~np.isfinite(sq_globals)] = -1
+        return sq_globals
+  else:
+    tree_nodes_pad = functools.partial(pad, n_pad=pad_n_node)
+    tree_edges_pad = functools.partial(pad, n_pad=pad_n_edge)
+
+    def tree_globs_pad(globals_):
+      return pad(globals_, n_pad=pad_n_empty_graph)
 
   # Correct zero padding of senders and receivers
   edge_pad_idx = np.tile(
@@ -135,7 +179,8 @@ def build_dataset_iterator(dataset_config: config.Dataset,
                            debug: bool = False,
                            do_bucket_by_size: bool = False,
                            bucket_boundaries: Sequence[int] = (255, 511),
-                           bucket_batch_size_factors: Sequence[int] = (4, 2, 1),
+                           bucket_batch_size_factors: Sequence[int] = (
+                             4, 2, 1),
                            is_training: bool = True,
                            max_token_length: int = 1023,
                            max_number_of_instances: int = -1,
@@ -144,11 +189,14 @@ def build_dataset_iterator(dataset_config: config.Dataset,
                            num_parallel_batchers: Optional[int] = None,
                            posenc_config: Optional[Dict[str, Any]] = None):
   """Creates a dataset generator and does the important preprocessing steps."""
+  num_local_devices = jax.local_device_count()
+
   if debug:
-    max_items_to_read_from_dataset = batch_size
+    max_items_to_read_from_dataset = int(num_local_devices * batch_size)
     prefetch_buffer_size = 1
     shuffle_buffer_size = 1
     num_parallel_batchers = 1
+    drop_remainder = False
   else:
     max_items_to_read_from_dataset = -1  # < 0 means no limit.
     prefetch_buffer_size = 64
@@ -156,8 +204,7 @@ def build_dataset_iterator(dataset_config: config.Dataset,
     shuffle_buffer_size = int(1e6)
     if is_training and num_parallel_batchers is None:
       num_parallel_batchers = 4
-
-  num_local_devices = jax.local_device_count()
+    drop_remainder = is_training
 
   ds = ds.filter(
       lambda graph, *args: tf.math.reduce_any(graph.n_node < max_token_length))
@@ -187,7 +234,7 @@ def build_dataset_iterator(dataset_config: config.Dataset,
     if "-df" in dataset_config.name:
       mask = tf.ones_like(graph.edges["edge_type"], dtype=tf.bool)
       if exclude_control_flow_edges:
-        # These edges are the equivariant version of python_graphs
+        # These edges are our data-flow centric control flow edges
         mask = graph.edges["edge_type"] != 1
       if exclude_next_syntax_edges:
         # These edges are the original control flow edges of python_graphs
@@ -212,7 +259,7 @@ def build_dataset_iterator(dataset_config: config.Dataset,
   ### Explicit static batching due to self-attention over nodes. ###
   if not do_bucket_by_size or not is_training:
     ds = ds.padded_batch(
-        num_local_devices * batch_size, drop_remainder=is_training)
+        num_local_devices * batch_size, drop_remainder=drop_remainder)
   else:
     full_batch_size = num_local_devices * batch_size
     ds = ds.bucket_by_sequence_length(
@@ -222,7 +269,7 @@ def build_dataset_iterator(dataset_config: config.Dataset,
         bucket_batch_sizes=[
             factor * full_batch_size for factor in bucket_batch_size_factors
         ],
-        drop_remainder=is_training)
+        drop_remainder=drop_remainder)
 
   if is_training:
     ds = ds.repeat()
@@ -236,15 +283,21 @@ def build_dataset_iterator(dataset_config: config.Dataset,
       posenc_config is not None and
       posenc_config.get("posenc_type", "") == "maglap")
   if calc_eigenvals_and_vecs:
-    eigv_magnetic_laplacian = functools.partial(
-        utils.eigv_magnetic_laplacian_numba_batch,
+    eigv_magnetic_config = dict(
         k=posenc_config.get("top_k_eigenvectors", 5),
         k_excl=posenc_config.get("excl_k_eigenvectors", 1),
         q=posenc_config.get("maglap_q", 0.25),
         q_absolute=posenc_config.get("maglap_q_absolute", True),
         use_symmetric_norm=posenc_config.get("maglap_symmetric_norm", False),
         norm_comps_sep=posenc_config.get("maglap_norm_comps_sep", False),
-        sign_rotate=not posenc_config.get("maglap_sign_rotate", True))
+        sign_rotate=posenc_config.get("maglap_sign_rotate", True))
+    eigv_magnetic_laplacian = functools.partial(
+        utils.eigv_magnetic_laplacian_numba_batch, **eigv_magnetic_config)
+    if "-df" in dataset_config.name:
+      eigv_magnetic_config['l2_norm'] = posenc_config.get("maglap_l2_norm",
+                                                          True)
+      eigv_magnetic_config['exclude_cfg'] = exclude_control_flow_edges
+      eigv_magnetic_config['exclude_ns'] = exclude_next_syntax_edges
 
     numba.set_num_threads(
         min(NUM_THREADS_EIGENVECTORS, numba.get_num_threads()))
@@ -253,13 +306,30 @@ def build_dataset_iterator(dataset_config: config.Dataset,
     logging.info("Number of cores %d", multiprocessing.cpu_count())
 
   for sample in ds.as_numpy_iterator():
-    # Doing these preprocessing here is not optimal, however, maneuvre
-    # around some limitations of TFDS etc.
-    sample = _pad_to_next_power_of_two(sample)
 
-    if calc_eigenvals_and_vecs:
+    # Precomputed eigenvectors need to be added prior to final padding
+    eigenvalues, eigenvectors = None, None
+    if 'eigendecomposition' in sample.globals:
+      eigendecomposition = sample.globals.pop('eigendecomposition')
+      if calc_eigenvals_and_vecs:
+        for entry, val, vec in eigendecomposition:
+          # Assuming that the elements are always in the same order
+          entry = jax.tree_map(lambda x: x[0], entry)
+          if all([k in entry and np.isclose(v, entry[k])
+                  for k, v in eigv_magnetic_config.items()]):
+            eigenvalues, eigenvectors = val, vec
+
+        if eigenvectors is not None:
+          if not isinstance(sample.nodes, dict):
+            sample = sample._replace(nodes={"node_feat": sample.nodes})
+          sample.nodes["eigenvectors"] = eigenvectors
+
+    # Doing these preprocessing here is not optimal, however, it is a simple
+    # approach to maneuvers around some limitations of TFDS etc.
+    sample = _pad_to_next_power_of_two(sample, dataset_config)
+
+    if calc_eigenvals_and_vecs and eigenvalues is None:
       logging.debug("Start eigenvalues and vectors calculation")
-
       try:
         eigenvalues, eigenvectors = eigv_magnetic_laplacian(
             sample.senders, sample.receivers, sample.n_node)
@@ -275,13 +345,18 @@ def build_dataset_iterator(dataset_config: config.Dataset,
 
       if not isinstance(sample.nodes, dict):
         sample = sample._replace(nodes={"node_feat": sample.nodes})
-
       sample.nodes["eigenvectors"] = eigenvectors
-      # This is not accurate, but gloabls are treated differently
+      # This is not accurate, but globals are treated differently
       sample.nodes["eigenvalues"] = eigenvalues
       logging.debug("Finished eigenvalues and vectors calculation")
 
-    if is_training:
+    if calc_eigenvals_and_vecs:
+      # This is not accurate, but globals are treated differently later on
+      sample.nodes["eigenvalues"] = eigenvalues
+
+    sample = jax.tree_map(
+        lambda x: jnp.array(x) if x.dtype != object else x, sample)
+    if jax.device_count() > 1 and is_training:
       sample = jax.tree_map(reshape, sample)
     yield sample
 
@@ -291,6 +366,8 @@ def dataset_generator(path: str, split: str):
   """
   base_path = os.path.join(path, split)
   for file in os.listdir(base_path):
+    if not file.endswith('.npz') or 'meta' in file:
+      continue
     for instance in np.load(
-        os.path.join(base_path, file), allow_pickle=True)["data"]:
+            os.path.join(base_path, file), allow_pickle=True)["data"]:
       yield tuple(instance)

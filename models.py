@@ -16,16 +16,19 @@
 import dataclasses
 import functools
 from typing import Any, Callable, Optional, Sequence, Tuple, Union
+import warnings
 
 from absl import logging
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import jraph
+import numpy as np
 
 # pylint: disable=g-bad-import-order
 import config
 import layers
+import magnet
 import utils
 from ogb_utils import ASTNodeEncoder
 
@@ -40,6 +43,7 @@ Tensor = utils.Tensor
 softmax_cross_entropy_loss = utils.softmax_cross_entropy_loss
 count_edges = utils.count_edges
 exact_ppr, k_step_random_walk = utils.exact_ppr, utils.k_step_random_walk
+svd_encodings = utils.svd_encodings
 sinusoid_position_encoding = utils.sinusoid_position_encoding
 
 
@@ -54,14 +58,14 @@ class PositionalEncodingsParams:
   # al., 2020 or the real value of the (magnetic) laplacian eigenvectors
   # If using maglap, this implies that we have complex queries and key in attn.
   relative_positional_encodings: bool = True
-  # Exlcude AST depth in OGB or sinusoidal for sorting networks
+  # Exclude AST depth in OGB or sinusoidal for sorting networks
   exclude_canonical: bool = False
 
   ### 'rw', 'ppr'
-  # Not onlye consider the position in the direction of the graph
+  # Not only consider the position in the direction of the graph
   do_also_reverse: bool = True
   # If using ppr/rw, the restart probability for the ppr
-  ppr_restart_probaility: float = 0.2
+  ppr_restart_probability: float = 0.2
   # If using rw, the number of random walk steps
 
   ### 'maglap'
@@ -69,7 +73,7 @@ class PositionalEncodingsParams:
   # If using maglap, the k eigenvecotrs to use starting from excl_k_eigenvectors
   top_k_eigenvectors: int = 10
   # If using maglap, exclude the excl_k_eigenvectors most top eigenvectors
-  excl_k_eigenvectors: int = 1
+  excl_k_eigenvectors: int = 0
   # If using maglap and true, also the eigenvalues are considered
   concatenate_eigenvalues: bool = False
   # If using maglap, the q factor for directionality
@@ -85,7 +89,7 @@ class PositionalEncodingsParams:
   # If using maglap and `maglap_transformer`= True and if true, real and imag
   # components are separately normalized.
   maglap_norm_comps_sep: bool = False
-  # If using maglap and False, we normalize the eigevectors to span [0,1]
+  # If using maglap and False, we normalize the eigenvectors to span [0,1]
   # (ignoring eigenvectors of very low magnitude)
   maglap_l2_norm: bool = True
   # To force the network to work also with a subset of vectors
@@ -96,6 +100,8 @@ class PositionalEncodingsParams:
   # Use the sign convention and rotation (i.e. the absolute largest real value
   # is positive and phase shift starts at 0)
   maglap_sign_rotate: bool = True
+  # Rotation invariant MagLapNet
+  maglap_net_type: str = 'signnet'
 
 
 @dataclasses.dataclass
@@ -109,12 +115,12 @@ class DataFlowASTEncoder(hk.Module):
   """Encodes the AST for our graph construction procedure."""
 
   def __init__(self,
-               emb_dim: int,
-               num_nodetypes: int,
-               num_nodeattributes: int,
-               max_depth: int,
-               num_edge_df_types: int,
-               num_edge_ast_types: int,
+               emb_dim,
+               num_nodetypes,
+               num_nodeattributes,
+               max_depth,
+               num_edge_df_types,
+               num_edge_ast_types,
                attribute_dropout: float = 0.0,
                name=None):
     super().__init__(name=name)
@@ -174,6 +180,48 @@ class SortingNetworkEncoder(hk.Module):
   def __init__(self,
                emb_dim: int,
                encode_order: bool = True,
+               num_nodeattributes: int = 26,
+               name: Optional[str] = None):
+    super().__init__(name=name)
+    self.emb_dim = emb_dim
+    self.encode_order = encode_order
+    self.num_nodeattributes = num_nodeattributes
+
+  def __call__(
+      self,
+      graph: jraph.GraphsTuple,
+      depth: Any = None,
+      call_args: CallArgs = CallArgs(True)) -> jraph.GraphsTuple:
+
+    assert depth is None
+    nodes_int = graph.nodes.astype(jnp.int32)
+
+    argument_1 = sinusoid_position_encoding(
+        nodes_int[..., 1],
+        max_timescale=int(self.num_nodeattributes),
+        hidden_size=self.emb_dim // 2)
+    argument_2 = sinusoid_position_encoding(
+        nodes_int[..., 2],
+        max_timescale=int(self.num_nodeattributes),
+        hidden_size=self.emb_dim // 2)
+    nodes = jnp.concatenate((argument_1, argument_2), axis=-1)
+
+    nodes = hk.Linear(self.emb_dim)(nodes)
+
+    if self.encode_order:
+      node_id = sinusoid_position_encoding(nodes_int[..., 0], self.emb_dim)
+      nodes += node_id
+
+    graph = graph._replace(nodes=nodes)
+    return graph
+
+
+class DistanceEncoder(hk.Module):
+  """Encodes the Positional Encoding Playground graph."""
+
+  def __init__(self,
+               emb_dim: int,
+               encode_order: bool = True,
                num_nodeattributes: int = 11,
                name: Optional[str] = None):
     super().__init__(name=name)
@@ -188,19 +236,8 @@ class SortingNetworkEncoder(hk.Module):
       call_args: CallArgs = CallArgs(True)) -> jraph.GraphsTuple:
 
     assert depth is None
-    nodes = graph.nodes.astype(jnp.int32)
 
-    argument_1 = sinusoid_position_encoding(
-        nodes[..., 1],
-        max_timescale=int(2 * self.num_nodeattributes),
-        hidden_size=self.emb_dim // 2)
-    argument_2 = sinusoid_position_encoding(
-        nodes[..., 2],
-        max_timescale=int(2 * self.num_nodeattributes),
-        hidden_size=self.emb_dim // 2)
-    nodes = jnp.concatenate((argument_1, argument_2), axis=-1)
-
-    nodes = hk.Linear(self.emb_dim)(nodes)
+    nodes = jnp.zeros((*graph.nodes.shape, self.emb_dim), dtype=jnp.float32)
 
     if self.encode_order:
       node_id = sinusoid_position_encoding(nodes[..., 0], self.emb_dim)
@@ -208,6 +245,41 @@ class SortingNetworkEncoder(hk.Module):
 
     graph = graph._replace(nodes=nodes)
     return graph
+
+
+class NaiveMagLapNet(hk.Module):
+  """For the Magnetic Laplacian's or Combinatorial Laplacian's eigenvectors.
+
+    Args:
+      d_model_elem: Dimension to map each eigenvector.
+      d_model_aggr: Output dimension.
+      num_heads: Number of heads for optional attention.
+      n_layers: Number of layers for MLP/GNN.
+      dropout_p: Dropout for attention as well as eigenvector embeddings.
+      activation: Element-wise non-linearity.
+      concatenate_eigenvalues: If True also concatenate the eigenvalues.
+      norm: Optional norm.
+      name: Name of the layer.
+  """
+
+  def __init__(
+        self,
+        d_model_aggr: int = 256,
+        name: Optional[str] = None,
+        *args,
+        **kwargs):
+    super().__init__(name=name)
+    self.d_model_aggr = d_model_aggr
+    
+  
+  def __call__(self, graph: jraph.GraphsTuple, eigenvalues: Tensor,
+               eigenvectors: Tensor, call_args: CallArgs,
+               mask: Optional[Tensor] = None) -> Tensor:
+
+    # Naive version
+    re = hk.Linear(self.d_model_aggr)(jnp.real(eigenvectors))
+    im = hk.Linear(self.d_model_aggr)(jnp.imag(eigenvectors))
+    return re + im
 
 
 class MagLapNet(hk.Module):
@@ -218,7 +290,7 @@ class MagLapNet(hk.Module):
       d_model_aggr: Output dimension.
       num_heads: Number of heads for optional attention.
       n_layers: Number of layers for MLP/GNN.
-      dropout_p: Dropout for attenion as well as eigenvector embeddings.
+      dropout_p: Dropout for attention as well as eigenvector embeddings.
       activation: Element-wise non-linearity.
       return_real_output: True for a real number (otherwise complex).
       consider_im_part: Ignore the imaginary part of the eigenvectors.
@@ -295,7 +367,8 @@ class MagLapNet(hk.Module):
           name='im_aggregate')
 
   def __call__(self, graph: jraph.GraphsTuple, eigenvalues: Tensor,
-               eigenvectors: Tensor, call_args: CallArgs) -> Tensor:
+               eigenvectors: Tensor, call_args: CallArgs,
+               mask: Optional[Tensor] = None) -> Tensor:
     padding_mask = (eigenvalues > 0)[..., None, :]
     padding_mask = padding_mask.at[..., 0].set(True)
     attn_padding_mask = padding_mask[..., None] & padding_mask[..., None, :]
@@ -305,6 +378,16 @@ class MagLapNet(hk.Module):
     if self.consider_im_part and jnp.iscomplexobj(eigenvectors):
       trans_eig_im = jnp.imag(eigenvectors)[..., None]
       trans_eig = jnp.concatenate((trans_eig, trans_eig_im), axis=-1)
+    else:
+      if not self.use_signnet:
+        # Like to Dwivedi & Bresson (2021)
+        rand_sign_shape = (*trans_eig.shape[:-3], 1, *trans_eig.shape[-2:])
+        rand_sign = jax.random.rademacher(hk.next_rng_key(), rand_sign_shape)
+        trans_eig = rand_sign * trans_eig
+      # Lower impact of numerical issues, assumes `k_excl` = 0
+      trans_eig = trans_eig.at[..., 0, :].set(
+          jnp.absolute(trans_eig[..., 0, :]))
+      eigenvalues = eigenvalues.at[..., 0].set(0)
 
     if self.use_gnn:
       trans = self.element_gnn(
@@ -312,11 +395,18 @@ class MagLapNet(hk.Module):
       if self.use_signnet:
         trans_neg = self.element_gnn(
             graph._replace(nodes=-trans_eig, edges=None), call_args).nodes
+        # assumes `k_excl` = 0
+        if self.consider_im_part and jnp.iscomplexobj(eigenvectors):
+          trans_neg = trans_neg.at[..., 0, :].set(0)
         trans += trans_neg
     else:
       trans = self.element_mlp(trans_eig)
       if self.use_signnet:
-        trans += self.element_mlp(-trans_eig)
+        trans_neg = self.element_mlp(-trans_eig)
+        # assumes `k_excl` = 0
+        if self.consider_im_part and jnp.iscomplexobj(eigenvectors):
+          trans_neg = trans_neg.at[..., 0, :].set(0)
+        trans += trans_neg
 
     if self.concatenate_eigenvalues:
       eigenvalues_ = jnp.broadcast_to(eigenvalues[..., None, :],
@@ -362,7 +452,7 @@ class GNN(hk.Module):
 
     Attributes:
       d_model: number of hidden dimensions.
-      activation: The activation fucntion.
+      activation: The activation function.
       gnn_type: Either `gcn` or `gnn`
       use_edge_attr: If True also the edge attributes are considered. Must be
         True for `gnn_type=gcn`.
@@ -374,7 +464,7 @@ class GNN(hk.Module):
       concat: If True all intermediate node embeddings are concatenated and then
         mapped to `d_model` in the output MLP.
       residual: If True the GNN embeddings
-      bidirectional: If True, edhes in both directions are considered (only
+      bidirectional: If True, edges in both directions are considered (only
         relevant for `gnn_type=gnn`).
       name: Name of module.
       **kwargs:
@@ -407,7 +497,8 @@ class GNN(hk.Module):
     self.residual = residual
     self.bidirectional = bidirectional
 
-    logging.info('GNN.__init__() received unexpected kwargs: %s', kwargs)
+    if kwargs:
+      logging.info('GNN.__init__() received unexpected kwargs: %s', kwargs)
 
   def _layer(self,
              idx: int) -> Callable[[jraph.GraphsTuple], jraph.GraphsTuple]:
@@ -443,11 +534,12 @@ class GNN(hk.Module):
   def _update_fn(self, features: Tensor, sender_features: Tensor,
                  receiver_features: Tensor, globals_: Any,
                  exclude_features: bool, name: str):
-    stack = [features, sender_features, receiver_features]
+    if self.bidirectional:
+      stack = [features, sender_features, receiver_features]
+    else:
+      stack = [features, sender_features + receiver_features]
     if exclude_features:
       stack = stack[1:]
-    if not self.bidirectional:
-      stack = stack[:-1]
     concat_features = jnp.concatenate(stack, axis=-1)
     return mlp(
         concat_features,
@@ -488,9 +580,9 @@ class GNN(hk.Module):
 
 
 class TransformerEncoderLayer(hk.Module):
-  """The transoformer encoder layer.
+  """The transformer encoder layer.
 
-  Main differences to the common implementation is the option to appply a GNN to
+  Main differences to the common implementation is the option to apply a GNN to
   query and key, as well as handling complex valued positional encodings.
 
   Attributes:
@@ -499,13 +591,12 @@ class TransformerEncoderLayer(hk.Module):
     dense_widening_factor: factor to enlarge MLP after attention.
     dropout_p: Probability dropout.
     with_bias: If the linear projections shall have a bias.
-    re_im_separate_projection: Apply a joint (False) or seperate projection
+    re_im_separate_projection: Apply a joint (False) or separate projection
       (True) for complex values query and key.
-    with_posenc_residual: If True GNN output and posenc are aggreagted.
-    se: If to apply a sturcutral encoding to query and key (either `gnn` or ``).
+    se: If to apply a structural encoding to query and key (either `gnn` or ``).
     norm: The batch/layer norm.
     pre_norm: If applying norm before attention.
-    activation: The activation fucntion.
+    activation: The activation function.
     gnn_config: Config for GNN.
     name: Name of the layer.
   """
@@ -518,7 +609,6 @@ class TransformerEncoderLayer(hk.Module):
       dropout_p=0.2,
       with_attn_dropout=True,
       re_im_separate_projection=False,
-      with_posenc_residual=False,
       with_bias=False,
       activation=jax.nn.relu,
       norm: Any = LayerNorm,
@@ -533,8 +623,11 @@ class TransformerEncoderLayer(hk.Module):
     self.dropout_p = dropout_p
     self.with_bias = with_bias
     self.re_im_separate_projection = re_im_separate_projection
-    self.with_posenc_residual = with_posenc_residual
-    self.se = gnn_config.get('se', 'gnn')
+    if not isinstance(gnn_config, dict):
+      gnn_config = gnn_config.to_dict()
+    else:
+      gnn_config = gnn_config.copy()
+    self.se = gnn_config.pop('se', 'gnn')
 
     self.norm = norm
     self.pre_norm = pre_norm
@@ -559,25 +652,6 @@ class TransformerEncoderLayer(hk.Module):
         with_bias=self.with_bias,
         re_im_separate_projection=self.re_im_separate_projection)
 
-  def posenc_residual(self, posenc, embedding):
-    re_mlp = MLP(
-        self.d_model,
-        n_layers=1,
-        activation=self.activation,
-        with_norm=False,
-        final_activation=True,
-        name='re_residual')
-    im_mlp = MLP(
-        self.d_model,
-        n_layers=1,
-        activation=self.activation,
-        with_norm=False,
-        final_activation=True,
-        name='im_residual')
-    embedding = (
-        re_mlp(jnp.real(posenc) + embedding) +
-        1j * im_mlp(jnp.imag(posenc) + embedding))
-    return embedding
 
   def __call__(self,
                graph: jraph.GraphsTuple,
@@ -610,8 +684,6 @@ class TransformerEncoderLayer(hk.Module):
       if posenc.ndim > query.ndim:
         logit_offset = posenc
         posenc = None
-      elif self.with_posenc_residual:
-        query = key = self.posenc_residual(posenc, query)
       else:
         query = key = query + posenc
 
@@ -676,10 +748,10 @@ class StructureAwareTransformer(hk.Module):
     input_embedder: an embedder for the raw graph's features.
     gnn_config: Config for GNN
     attention_config: Config for Attention
-    max_seq_len: number of prediciton to be made per graph.
-    global_readout: how to aggreagte the node embeddings. One of `1`, `cls`,
+    max_seq_len: number of prediction to be made per graph.
+    global_readout: how to aggregate the node embeddings. One of `1`, `cls`,
       `mean`, `sum_n`.
-    activation: The activation fucntion.
+    activation: The activation function.
     batch_norm: If True use BatchNorm, otherwise use LayerNorm.
     deg_sensitive_residual: If True normalize residual by node degree.
     with_pre_gnn: If True apply a GNN before the transformer.
@@ -746,7 +818,12 @@ class StructureAwareTransformer(hk.Module):
           **attention_config)
       self.encoder = GraphTransformerEncoder(
           [layer() for idx in range(num_layers)])
+    elif model_type == 'magnet':
+      self.encoder = magnet.MagNet(
+          d_model, activation=self.activation, q=posenc_config.maglap_q,
+          q_absolute=posenc_config.maglap_q_absolute, **gnn_config)
     else:
+      warnings.warn(f'Falling back to `gnn` model (given type {model_type})')
       self.encoder = GNN(d_model, activation=self.activation, **gnn_config)
 
     self.pre_gnn = None
@@ -780,21 +857,25 @@ class StructureAwareTransformer(hk.Module):
       self.pre_gnn = jraph.GraphNetwork(
           update_edge_fn=update_edge_fn, update_node_fn=update_node_fn)
 
-    use_rel_posenc = self.posenc_config.relative_positional_encodings
-    self.sign_net = self.sign_net = MagLapNet(
-        self.d_model // 32,
-        self.d_model,
-        num_heads=attention_config.get('num_heads', 4),
-        n_layers=1,
-        dropout_p=self.posenc_config.maglap_dropout_p,
-        concatenate_eigenvalues=self.posenc_config.concatenate_eigenvalues,
-        consider_im_part=self.posenc_config.maglap_q != 0.,
-        activation=self.activation,
-        use_signnet=self.posenc_config.maglap_use_signnet,
-        use_gnn=self.posenc_config.maglap_use_gnn,
-        use_attention=self.posenc_config.maglap_transformer,
-        norm=self.norm if self.posenc_config.maglap_transformer else None,
-        return_real_output=not use_rel_posenc)
+    if self.posenc_config.posenc_type == 'maglap':
+      use_rel_posenc = self.posenc_config.relative_positional_encodings
+      if self.posenc_config.maglap_net_type == 'naive':
+        self.maglap_net = NaiveMagLapNet(self.d_model)
+      else:
+        self.maglap_net = MagLapNet(
+            self.d_model // 32,
+            self.d_model,
+            num_heads=attention_config.get('num_heads', 4),
+            n_layers=1,
+            dropout_p=self.posenc_config.maglap_dropout_p,
+            concatenate_eigenvalues=self.posenc_config.concatenate_eigenvalues,
+            consider_im_part=self.posenc_config.maglap_q != 0.,
+            activation=self.activation,
+            use_signnet=self.posenc_config.maglap_use_signnet,
+            use_gnn=self.posenc_config.maglap_use_gnn,
+            use_attention=self.posenc_config.maglap_transformer,
+            norm=self.norm if self.posenc_config.maglap_transformer else None,
+            return_real_output=not use_rel_posenc)
 
   def activation_fn(self, activation: str):
     """Get activation function from name."""
@@ -810,7 +891,8 @@ class StructureAwareTransformer(hk.Module):
       graph: jraph.GraphsTuple,
       eigenvalues: Optional[Tensor] = None,
       eigenvectors: Optional[Tensor] = None,
-      call_args: CallArgs = CallArgs(True)
+      call_args: CallArgs = CallArgs(True),
+      mask: Optional[Tensor] = None
   ) -> Tuple[jraph.GraphsTuple, Optional[Tensor]]:
     """Adds the positional encodings."""
     if not self.posenc_config.posenc_type:
@@ -818,35 +900,51 @@ class StructureAwareTransformer(hk.Module):
 
     if self.posenc_config.posenc_type == 'ppr':
       ppr = exact_ppr(
-          graph, restart_p=self.posenc_config.ppr_restart_probaility)
+          graph, restart_p=self.posenc_config.ppr_restart_probability)
       if self.posenc_config.do_also_reverse:
         backward_ppr = exact_ppr(
             graph,
-            restart_p=self.posenc_config.ppr_restart_probaility,
+            restart_p=self.posenc_config.ppr_restart_probability,
             reverse=True)
         posenc = jnp.stack((ppr, backward_ppr), axis=-1)
       else:
         posenc = ppr[..., None]
     elif self.posenc_config.posenc_type == 'rw':
-      rw = k_step_random_walk(
+      posenc = k_step_random_walk(
           graph,
           k=self.posenc_config.random_walk_steps,
-          ppr_restart_p=self.posenc_config.ppr_restart_probaility)
+          ppr_restart_p=self.posenc_config.ppr_restart_probability)
       if self.posenc_config.do_also_reverse:
         backward_rw = k_step_random_walk(
             graph,
             k=self.posenc_config.random_walk_steps,
-            ppr_restart_p=self.posenc_config.ppr_restart_probaility,
+            ppr_restart_p=self.posenc_config.ppr_restart_probability,
             reverse=True)
-        posenc = jnp.concatenate((rw, backward_rw), axis=-1)
+        posenc = jnp.concatenate((posenc, backward_rw), axis=-1)
+    elif self.posenc_config.posenc_type == 'svd':
+      posenc = svd_encodings(graph, rank=self.posenc_config.top_k_eigenvectors)
+      # Like to Hussain (2022)
+      rand_sign_shape = (*posenc.shape[:-2], 1, *posenc.shape[-1:])
+      rand_sign = jax.random.rademacher(hk.next_rng_key(), rand_sign_shape)
+      posenc = rand_sign * posenc
+      posenc = mlp(
+          posenc,
+          self.d_model,
+          activation=self.activation,
+          n_layers=1,
+          with_norm=False,
+          final_activation=True,
+          name='posenc_mlp')
+      graph = graph._replace(nodes=graph.nodes + posenc)
+      # Otherwise, we interpret the encoding as relative
+      posenc = None
     elif self.posenc_config.posenc_type == 'maglap':
       # We might have already loaded the eigenvalues, -vectors
       if eigenvalues is None or eigenvectors is None:
         raise RuntimeError('Eigenvectors and eigenvalues were not provided.')
-      else:
-        posenc = (eigenvalues, eigenvectors)
 
-      posenc = self.sign_net(graph, *posenc, call_args=call_args)
+      posenc = self.maglap_net(
+          graph, eigenvalues, eigenvectors, call_args=call_args, mask=mask)
 
       if not self.posenc_config.relative_positional_encodings:
         graph = graph._replace(nodes=graph.nodes + posenc)
@@ -858,11 +956,9 @@ class StructureAwareTransformer(hk.Module):
       )
 
     if (not self.posenc_config.relative_positional_encodings and
-        self.posenc_config.posenc_type != 'maglap'):
-      assert self.posenc_config.posenc_type in ['ppr', 'rw']
-      assert posenc is not None
+        self.posenc_config.posenc_type in ['ppr', 'rw']):
       posenc = hk.Linear(posenc.shape[-1], name='posenc_linear')(posenc)
-      posenc = self.activation(posenc).sum(axis=-3)
+      posenc = (self.activation(posenc) * mask[..., None]).sum(axis=-3)
       posenc = mlp(
           posenc,
           self.d_model,
@@ -878,7 +974,7 @@ class StructureAwareTransformer(hk.Module):
     return graph, posenc
 
   def readout(self, graph: jraph.GraphsTuple) -> Tensor:
-    """For the aggregate prediciton over for the graph."""
+    """For the aggregate prediction over for the graph."""
     if self.global_readout == 1 or self.global_readout == '1':
       return graph.nodes[..., 1, :]
     elif self.global_readout == 'cls':
@@ -934,8 +1030,9 @@ class StructureAwareTransformer(hk.Module):
     if self.pre_gnn is not None:
       graph = graph._replace(nodes=jax.vmap(self.pre_gnn)(graph).nodes)
 
+    padding_mask = self.get_padding_mask(graph)
     graph, posenc = self.positional_encodings(graph, eigenvalues, eigenvectors,
-                                              call_args)
+                                              call_args, mask=padding_mask)
 
     if self.global_readout == 'cls':
       cls_token = hk.get_parameter('cls_token', (1, self.d_model), jnp.float32,
@@ -943,20 +1040,34 @@ class StructureAwareTransformer(hk.Module):
       n_node = graph.n_node.astype(jnp.int32)
       nodes = graph.nodes.at[jnp.arange(graph.nodes.shape[0]),
                              n_node[..., 0].astype(jnp.int32)].set(cls_token)
-      n_node = n_node.at[:, 0].add(1)
-      n_node = n_node.at[:, 1].add(-1)
+      n_node = n_node.at[..., 0].add(1)
+      n_node = n_node.at[..., 1].add(-1)
       graph = graph._replace(nodes=nodes, n_node=n_node)
+      # New padding mask due to added node
+      padding_mask = self.get_padding_mask(graph)
 
     graph = self.encoder(
         graph,
         call_args=call_args,
         posenc=posenc,
         invnorm_degree=invnorm_degree,
-        mask=self.get_padding_mask(graph))
+        mask=padding_mask)
 
     output = self.readout(graph)
 
     if self.num_class <= 0 or self.max_seq_len <= 0:
+      lead = len(graph.nodes.shape[:-2]) * (1,)
+      nodes = graph.nodes.shape[-2]
+
+      x_senders = jnp.tile(graph.nodes[..., :, None, :], lead + (1, nodes, 1))
+      x_receivers = jnp.tile(graph.nodes[..., None, :, :], lead + (nodes, 1, 1))
+      x_global = jnp.tile(output[..., None, None, :], lead + (nodes, nodes, 1))
+      x = jnp.concatenate((x_senders, x_receivers, x_global), axis=-1)
+      x = MLP(self.d_model, n_layers=2, activation=self.activation,
+              with_norm=True, final_activation=True, name='adj_mlp')(x)
+
+      dim_out = 1 if self.num_class <= 0 else self.num_class
+      output = hk.Linear(dim_out, name='adj_out')(x)
       return output
 
     classifier = hk.Linear(self.num_class * self.max_seq_len)
@@ -965,13 +1076,32 @@ class StructureAwareTransformer(hk.Module):
     return prediction
 
   def loss(self, graph: jraph.GraphsTuple, is_training=True):
-    prediciton = self.__call__(
+    prediction = self.__call__(
         graph._replace(globals=None), call_args=CallArgs(is_training))
-    loss = softmax_cross_entropy_loss(
-        prediciton, graph.globals['target'][..., 0, :].astype(jnp.int32),
-        self.num_class,
-        self.loss_config.only_punish_first_end_of_sequence_token)
-    return loss, prediciton
+    if self.num_class > 0 and self.max_seq_len > 0:
+      loss = softmax_cross_entropy_loss(
+          prediction, graph.globals['target'][..., 0, :].astype(jnp.int32),
+          self.num_class,
+          self.loss_config.only_punish_first_end_of_sequence_token)
+    else:
+      if isinstance(graph.nodes, dict):
+        graph = graph._replace(nodes=graph.nodes['node_feat'])
+      target = graph.globals['target']
+      mask = target >= 0
+
+      if self.num_class > 0:
+        target = jnp.where(mask, target, 0)
+        targets_one_hot = jax.nn.one_hot(target, self.num_class)
+
+        logits = jax.nn.log_softmax(prediction, axis=-1)
+        loss = -jnp.sum(targets_one_hot * logits, axis=-1)
+
+      else:
+        prediction = jax.nn.softplus(prediction[..., 0])
+        loss = (prediction - target) ** 2
+
+      loss = (loss * mask).sum(axis=(-2, -1)) / mask.sum(axis=(-2, -1))
+    return loss, prediction
 
 
 def get_model(  # pylint: disable=dangerous-default-value
@@ -994,7 +1124,8 @@ def get_model(  # pylint: disable=dangerous-default-value
     **kwargs):
   """Creates the model for the given configuration."""
 
-  logging.info('get_model() received kwargs: %s', kwargs)
+  if kwargs:
+    logging.info('get_model() received kwargs: %s', kwargs)
 
   posenc_config = PositionalEncodingsParams(**posenc_config)
 
@@ -1004,12 +1135,13 @@ def get_model(  # pylint: disable=dangerous-default-value
                                        dataset.ast_depth, dataset.edge_df_types,
                                        dataset.edge_ast_types, **encoder_config)
   elif dataset.name.startswith('sn'):
-    encode_order = (not posenc_config.posenc_type and
-                    not posenc_config.exclude_canonical)
     input_encoder = SortingNetworkEncoder(
         d_model,
         num_nodeattributes=dataset.num_nodeattributes,
-        encode_order=encode_order)
+        encode_order=not posenc_config.exclude_canonical)
+  elif dataset.name.startswith('dist'):
+    input_encoder = DistanceEncoder(
+      d_model, encode_order=not posenc_config.exclude_canonical)
   else:
     edge_dim = d_model if gnn_config.get('residual', False) else d_model // 2
     input_encoder = ASTNodeEncoder(

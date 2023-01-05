@@ -1,0 +1,16 @@
+# @package _global_
+default:
+  - override 
+
+config:
+  presets: bignn,maglappos,bbs
+  wandb:
+    tags: 
+      - maglap_naive
+
+overwrite:
+  experiment_kwargs:
+    config:
+      model:
+        posenc_config:
+          maglap_net_type: naive

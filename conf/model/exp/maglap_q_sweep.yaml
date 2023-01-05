@@ -1,0 +1,15 @@
+# @package _global_
+default:
+  - override 
+
+config:
+  presets: bignn,maglappos,bbs
+  wandb:
+    project: digt-sn-maglap
+    tags: 
+      - maglap_q_sweep
+
+hydra:
+  sweeper:
+    params:
+      +overwrite.experiment_kwargs.config.model.posenc_config.maglap_q: 0.025,0.25,2.5,25,250

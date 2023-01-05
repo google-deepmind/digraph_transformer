@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A jaxline experiment for predicitng the correctness of sorting networks or for graph property prediction on OGB Code2 dataset.
+"""A jaxline experiment for predicting the correctness of sorting networks or for graph property prediction on OGB Code2 dataset.
 
 https://ogb.stanford.edu/docs/graphprop/
 """
@@ -20,7 +20,8 @@ import datetime
 import functools
 import os
 import threading
-from typing import Dict, NamedTuple, Tuple
+import traceback
+from typing import Dict, NamedTuple, Optional, Tuple
 
 from absl import app
 from absl import flags
@@ -31,18 +32,27 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jaxline import experiment
-from jaxline import platform
-from jaxline import utils
+# from jaxline import platform
+from jaxline import utils as jutils
 import jraph
 import numpy as np
+from ogb.graphproppred import GraphPropPredDataset, Evaluator
 import optax
 import tensorflow as tf
 import tree
 
 # pylint: disable=g-bad-import-order
 import dataset_utils
+import engine
 import models
 import ogb_utils
+from utils import tp_fn_fp, prec_rec_f1
+
+try:
+  import wandb
+except:
+  wandb = None
+
 
 hk.experimental.profiler_name_scopes(enabled=True)
 jax.config.parse_flags_with_absl()
@@ -53,18 +63,33 @@ FLAGS = flags.FLAGS
 class _Predictions(NamedTuple):
   predictions: np.ndarray
   indices: np.ndarray
+  target: Optional[np.ndarray]
 
 
 def _sort_predictions_by_indices(predictions: _Predictions):
   sorted_order = np.argsort(predictions.indices)
   return _Predictions(
       predictions=predictions.predictions[sorted_order],
-      indices=predictions.indices[sorted_order])
+      indices=predictions.indices[sorted_order],
+      target=(None if predictions.target is None
+              else predictions.target[sorted_order]))
 
 
 def _disable_gpu_for_tf():
   tf.config.set_visible_devices([], "GPU")  # Hide local GPUs.
   os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
+def maybe_get_first(xs):
+  if jax.device_count() == 1:
+    return xs
+  return jutils.get_first(xs)
+
+
+def maybe_bcast_local_devices(xs):
+  if jax.device_count() == 1:
+    return xs
+  return jutils.bcast_local_devices(xs)
 
 
 class Experiment(experiment.AbstractExperiment):
@@ -88,7 +113,6 @@ class Experiment(experiment.AbstractExperiment):
 
   def __init__(self, mode, init_rng, config):
     """Initializes experiment."""
-    _disable_gpu_for_tf()
     super(Experiment, self).__init__(mode=mode, init_rng=init_rng)
     self.mode = mode
     self.init_rng = init_rng
@@ -101,11 +125,13 @@ class Experiment(experiment.AbstractExperiment):
 
     self.loss = None
     self.forward = None
-    self.evaluator = ogb_utils.Evaluator(self.dataset_config.name)
     # Needed for checkpoint restore.
     self._params = None
     self._network_state = None
     self._opt_state = None
+    # For eval on ogb
+    self.ogb_targets = None
+    self.ogb_evaluator = None
 
   #  _             _
   # | |_ _ __ __ _(_)_ __
@@ -122,9 +148,24 @@ class Experiment(experiment.AbstractExperiment):
                                       **self.config.model)
     loss, prediction = model_instance.loss(graph)
 
-    prediction = jnp.argmax(prediction, axis=-1)
-    accuracy = (prediction == graph.globals["target"][..., 0, :]).mean()
-    scalars = {"accuracy": accuracy, "loss": loss.mean()}
+    target = graph.globals["target"]
+    scalars = {"loss": loss.mean()}
+    if self.dataset_config.num_classes > 0:
+      prediction = jnp.argmax(prediction, axis=-1)
+      if self.dataset_config.name.startswith("dist"):
+        mask = target >= 0
+      else:
+        target = target[..., 0, :]
+        mask = jnp.ones_like(target, dtype=jnp.bool_)
+      accuracy = ((prediction == target) & mask).sum() / mask.sum()
+      scalars["accuracy"] = accuracy
+
+    if self.dataset_config.num_classes == 2:
+      scalars["tp"], scalars["fn"], scalars["fp"] = tp_fn_fp(
+        prediction, target, mask)
+      scalars["precision"], scalars["recall"], scalars["f1"] = prec_rec_f1(
+        scalars["tp"], scalars["fn"], scalars["fp"]
+      )
 
     return loss.sum(), scalars
 
@@ -159,8 +200,9 @@ class Experiment(experiment.AbstractExperiment):
 
     grad_loss_fn = jax.grad(get_loss, has_aux=True)
     out = grad_loss_fn(params, network_state, rng, *graph)
-    scaled_grads, (scalars, network_state) = out
-    grads = jax.lax.psum(scaled_grads, axis_name=self.config.pmap_axis)
+    grads, (scalars, network_state) = out
+    if jax.device_count() > 1:
+      grads = jax.lax.psum(grads, axis_name=self.config.pmap_axis)
     updates, opt_state = self.optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
 
@@ -170,21 +212,16 @@ class Experiment(experiment.AbstractExperiment):
   def _train_init(self):
     self.loss = hk.transform_with_state(self._loss)
 
-    self._train_input = utils.py_prefetch(
+    self._train_input = jutils.py_prefetch(
         lambda: self._build_numpy_dataset_iterator("train"), buffer_size=5)
     init_stacked_graphs = next(self._train_input)
-    init_key = utils.bcast_local_devices(self.init_rng)
-    p_init = jax.pmap(self.loss.init, axis_name=self.config.pmap_axis)
+    if jax.device_count() > 1:
+      init_key = jutils.bcast_local_devices(self.init_rng)
+      p_init = jax.pmap(self.loss.init, axis_name=self.config.pmap_axis)
+    else:
+      init_key = self.init_rng
+      p_init = self.loss.init
     self._params, self._network_state = p_init(init_key, *init_stacked_graphs)
-
-    # Does currently not work with batch norm
-    if not self.config.model.batch_norm:
-      model_info = hk.experimental.jaxpr_info.make_model_info(self.loss.apply)
-      mod = model_info(
-          jax.tree_map(lambda x: x[0], self._params),
-          jax.tree_map(lambda x: x[0], self._network_state), self.init_rng,
-          *jax.tree_map(lambda x: x[0], init_stacked_graphs))
-      logging.info(hk.experimental.jaxpr_info.format_module(mod))
 
     # Learning rate scheduling.
     lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -205,11 +242,22 @@ class Experiment(experiment.AbstractExperiment):
     self.optimizer = build_optimizer(lr_schedule,
                                      self.config.optimizer.optimizer_kwargs)
 
-    self._opt_state = jax.pmap(self.optimizer.init)(self._params)
-    self.update_parameters = jax.pmap(
-        self._update_parameters,
-        axis_name=self.config.pmap_axis,
-        donate_argnums=(0, 1, 2))
+    if self.config.optimizer.accumulate_gradient_k > 1:
+      g_k = self.config.optimizer.accumulate_gradient_k
+      self.optimizer = optax.MultiSteps(
+          self.optimizer, use_grad_mean=False, every_k_schedule=g_k)
+
+    if jax.device_count() > 1:
+      self._opt_state = jax.pmap(self.optimizer.init)(self._params)
+      self.update_parameters = jax.pmap(
+          self._update_parameters,
+          axis_name=self.config.pmap_axis,
+          donate_argnums=(0, 1, 2))
+    else:
+      self._opt_state = jax.jit(self.optimizer.init)(self._params)
+      self.update_parameters = jax.jit(
+          self._update_parameters,
+          donate_argnums=(0, 1, 2))
 
   def step(self, global_step, rng, **unused_args):
     """See base class."""
@@ -217,11 +265,14 @@ class Experiment(experiment.AbstractExperiment):
       self._train_init()
 
     graph = next(self._train_input)
+    if jax.device_count() == 1:
+      rng = rng[0]
     out = self.update_parameters(self._params, self._network_state,
                                  self._opt_state, global_step, rng, graph)
     (self._params, self._network_state, self._opt_state, scalars) = out
 
-    scalars = utils.get_first(scalars)
+    scalars = maybe_get_first(scalars)
+    scalars = jax.tree_map(lambda x: x.item(), scalars)
 
     scalars["local_device_count"] = jax.local_device_count()
     scalars["device_count"] = jax.device_count()
@@ -281,27 +332,34 @@ class Experiment(experiment.AbstractExperiment):
   def _ogb_performance_metrics(self, loss: np.ndarray, prediction: np.ndarray,
                                target: np.ndarray, target_raw: np.ndarray):
     """Creates unnormalised values for accumulation."""
-    accuracy = prediction == target[..., 0, :]
+    prediction_ = np.argmax(prediction, axis=-1)
+    accuracy = prediction_ == target
     values = {"accuracy": accuracy.sum(), "loss": loss.sum()}
     counts = {"accuracy": accuracy.size, "loss": loss.size}
     scalars = {"values": values, "counts": counts}
 
     if self.dataset_config.idx2vocab is None:
-      self.dataset_config.idx2vocab = np.load("<path-to-file>")
-      self.dataset_config.vocab2idx = np.load("<path-to-file>")
+      meta = np.load(os.path.join(self.config.data_root,
+                                  self.config.dataset.path, 'meta.npz'),
+                     allow_pickle=True)['data'].item()
+      self.dataset_config.idx2vocab = meta['idx2vocab']
+      self.dataset_config.vocab2idx = meta['vocab2idx']
 
     arr_to_seq = functools.partial(
         ogb_utils.decode_arr_to_seq, idx2vocab=self.dataset_config.idx2vocab)
-    seq_pred = [arr_to_seq(seq) for seq in prediction]
+    seq_pred = [arr_to_seq(seq) for seq in prediction_]
 
-    seq_ref = [[el for el in seq if el] for seq in target_raw[:, 0].astype("U")]
+    seq_ref = [[el for el in seq if el]
+               for seq in target_raw[:, 0].astype("U")]
 
     return scalars, seq_ref, seq_pred
 
   def _sn_performance_metrics(self, loss: np.ndarray, prediction: np.ndarray,
                               target: np.ndarray, seq_len: int):
     """Creates unnormalised values for accumulation."""
-    accuracy = prediction == target[..., 0, :]
+    prediction_ = np.argmax(prediction, axis=-1)
+    target = target[..., 0, :]
+    accuracy = prediction_ == target
     accuracy_sum = accuracy.sum()
 
     values = {
@@ -309,25 +367,95 @@ class Experiment(experiment.AbstractExperiment):
         f"accuracy_{seq_len}": accuracy_sum,
         "loss": loss.sum()
     }
+    tp, fn, fp = tp_fn_fp(prediction_, target)
+    values["tp"] = values[f"tp_{seq_len}"] = tp
+    values["fn"] = values[f"fn_{seq_len}"] = fn
+    values["fp"] = values[f"fp_{seq_len}"] = fp
     counts = {
+        "tp": 0,
+        "fn": 0,
+        "fp": 0,
+        f"tp_{seq_len}": 0,
+        f"fn_{seq_len}": 0,
+        f"fp_{seq_len}": 0,
         "accuracy": accuracy.size,
         f"accuracy_{seq_len}": accuracy.size,
         "loss": loss.size
     }
     scalars = {"values": values, "counts": counts}
 
-    return scalars, [], []
+    return scalars, target, []
+
+  def _dist_performance_metrics(self, loss: np.ndarray, prediction: np.ndarray,
+                                target: np.ndarray, skip=True):
+    """Creates unnormalised values for accumulation."""
+    if skip:
+      return {"values": {}, "counts": {}}, target, loss
+
+    mask = target >= 0
+
+    if self.dataset_config.num_classes > 0:
+      prediction_ = np.argmax(prediction, axis=-1)
+      accuracy = (prediction_ == target) & mask
+      accuracy_sum = accuracy.sum()
+
+      values = {"loss": loss.sum(), "accuracy": accuracy_sum}
+      values["tp"], values["fn"], values["fp"] = tp_fn_fp(
+          prediction_, target, mask)
+
+      counts = {
+          "tp": 0,
+          "fn": 0,
+          "fp": 0,
+          "loss": loss.size,
+          "accuracy": mask.sum(),
+      }
+
+      nb_nodes = mask[..., 0].sum(-1) + 1
+      for nb in np.unique(nb_nodes):
+        inst_mask = nb_nodes == nb
+
+        values[f"loss_{nb}"] = loss[inst_mask].sum()
+        values[f"accuracy_{nb}"] = accuracy[inst_mask].sum()
+        values[f"tp_{nb}"], values[f"fn_{nb}"], values[f"fp_{nb}"] = tp_fn_fp(
+            prediction_[inst_mask], target[inst_mask], mask[inst_mask])
+
+        counts.update({
+            f"tp_{nb}": 0,
+            f"fn_{nb}": 0,
+            f"fp_{nb}": 0,
+            f"loss_{nb}": inst_mask.sum(),
+            f"accuracy_{nb}": mask[inst_mask].sum(),
+        })
+    else:
+
+      values = {
+          "loss": loss.sum(),
+      }
+      counts = {
+          "loss": loss.size,
+      }
+
+      nb_nodes = mask[..., 0].sum(-1) + 1
+      for nb in np.unique(nb_nodes):
+        inst_mask = nb_nodes == nb
+        values.update({
+            f"loss_{nb}": loss[inst_mask].sum(),
+        })
+        counts.update({
+            f"loss_{nb}": inst_mask.sum(),
+        })
+
+    scalars = {"values": values, "counts": counts}
+
+    return scalars, target, []
+    # return scalars, target.flatten(), prediction[..., 0].flatten()
 
   def _get_prediction(self, params, state, rng,
                       graph) -> Tuple[np.ndarray, np.ndarray]:
     """Returns predictions for all the graphs in the dataset split."""
     model_output, _ = self.eval_apply(params, state, rng, *graph)
-    (loss, prediction) = model_output
-    prediction = jax.nn.softmax(prediction, axis=-1)
-    prediction = prediction.at[..., -2].add(-self.config.evaluation.unk_offset)
-    prediction = prediction.at[..., -1].add(-self.config.evaluation.eos_offset)
-    prediction = np.argmax(prediction, axis=-1)
-    return loss, prediction
+    return model_output
 
   def _sum_agg_two_level_struct_with_default(self, structure, default=0):
     """Two level version of `tree.map_structure(lambda *l: sum(l), *all_scalars)` that handles missing keys.
@@ -343,7 +471,10 @@ class Experiment(experiment.AbstractExperiment):
           accum[ckey][vkey] += values
     return accum
 
-  def _get_predictions(self, params, state, rng, graph_iterator):
+  def _get_predictions(self, params, state, rng, m2_offest, m1_offset, split):
+    graph_iterator = jutils.py_prefetch(
+        lambda: self._build_numpy_dataset_iterator(split), buffer_size=5)
+
     all_scalars = []
     all_seq_refs = []
     all_seq_preds = []
@@ -356,15 +487,22 @@ class Experiment(experiment.AbstractExperiment):
         target_raw = graph.globals["target_raw"]
         del graph.globals["target_raw"]
       loss, prediction = self._get_prediction(params, state, rng, graph)
+      if self.dataset_config.num_classes > 0:
+        prediction = jax.nn.softmax(prediction, axis=-1)
+        prediction = prediction.at[..., -2].add(-m2_offest)
+        prediction = prediction.at[..., -1].add(-m1_offset)
       if "target" in graph.globals and not jnp.isnan(
-          graph.globals["target"]).any():
-        if self.dataset_config.name.startswith("sn"):
+              graph.globals["target"]).any():
+        if self.dataset_config.name.startswith("dist"):
+          scalars, seq_ref, seq_pred = self._dist_performance_metrics(
+              loss, prediction, graph.globals["target"])
+        elif self.dataset_config.name.startswith("sn"):
           scalars, seq_ref, seq_pred = self._sn_performance_metrics(
               loss, prediction, graph.globals["target"],
               int(graph.nodes["node_feat"][..., 1:3].max().item()) + 1)
         else:
           scalars, seq_ref, seq_pred = self._ogb_performance_metrics(
-              loss, prediction, graph.globals["target"], target_raw)
+              loss, prediction, graph.globals["target"][..., 0, :], target_raw)
         all_scalars.append(scalars)
         all_seq_refs.extend(seq_ref)
         all_seq_preds.extend(seq_pred)
@@ -372,24 +510,77 @@ class Experiment(experiment.AbstractExperiment):
       graph_indices.append(graph.globals["graph_index"][:, 0])
 
       if i % 50 == 0:
-        logging.info("Generate predictons for %d batches so far", i + 1)
+        logging.info("Generated predictions for %d batches so far", i + 1)
 
+    if "dist" in self.dataset_config.name:
+      with jax.default_device(jax.devices("cpu")[0]):
+        all_scalars = [
+          self._dist_performance_metrics(
+              np.stack(all_seq_preds), np.concatenate(predictions),
+              np.stack(all_seq_refs), skip=False)[0]
+        ]
+
+    target = None
+    if isinstance(all_seq_refs[0], jnp.ndarray):
+      target = np.stack(all_seq_refs)
     predictions = _sort_predictions_by_indices(
-        _Predictions(
-            predictions=np.concatenate(predictions),
-            indices=np.concatenate(graph_indices)))
+        _Predictions(predictions=np.concatenate(predictions),
+                     indices=np.concatenate(graph_indices),
+                     target=target))
 
     if all_scalars:
       # Sum over graphs in the dataset.
       accum_scalars = self._sum_agg_two_level_struct_with_default(all_scalars)
-      scalars = tree.map_structure(lambda x, y: x / y, accum_scalars["values"],
+      scalars = tree.map_structure(lambda x, y: x / max(y, 1),
+                                   accum_scalars["values"],
                                    accum_scalars["counts"])
       if "ogbg-code2" in self.dataset_config.name:
+        if self.ogb_targets is None:
+          ds = GraphPropPredDataset("ogbg-code2", root=self.config.data_root)
+          self.ogb_targets = {}
+          for split_ in ["valid", "test"]:
+            self.ogb_targets[split_] = {
+                id_: ds[id_][1] for id_ in ds.get_idx_split()[split_]}
+        if self.ogb_evaluator is None:
+          self.ogb_evaluator = Evaluator("ogbg-code2")
+
+        # De-bias filtering out large graphs (> 1023 nodes)
+        indices = np.concatenate(graph_indices)
+        seq_pred = {
+          id_: prediction for id_, prediction in zip(indices, all_seq_preds)
+        }
+        seq_pred = [seq_pred[id_] if id_ in seq_pred else []
+                    for id_ in self.ogb_targets[split].keys()]
+
         scalars.update(
-            self.evaluator.eval({
-                "seq_ref": all_seq_refs,
-                "seq_pred": all_seq_preds
+            self.ogb_evaluator.eval({
+                "seq_ref": list(self.ogb_targets[split].values()),
+                "seq_pred": seq_pred
             }))
+      elif (("dist" in self.dataset_config.name
+             and self.dataset_config.num_classes == 2)
+            or self.dataset_config.name.startswith("sn")):
+        scalars["precision"], scalars["recall"], scalars["f1"] = prec_rec_f1(
+          scalars["tp"], scalars["fn"], scalars["fp"]
+        )
+        for nb in np.unique([
+                int(k.split('_')[-1]) for k in scalars.keys() if '_' in k]):
+          prec_rec_f1_ = prec_rec_f1(
+            scalars[f"tp_{nb}"], scalars[f"fn_{nb}"], scalars[f"fp_{nb}"]
+          )
+          scalars.update({
+            f"precision_{nb}": prec_rec_f1_[0],
+            f"recall_{nb}": prec_rec_f1_[1],
+            f"f1_{nb}": prec_rec_f1_[2]
+          })
+
+      elif ("dist" in self.dataset_config.name
+            and self.dataset_config.num_classes < 0):
+        with jax.default_device(jax.devices("cpu")[0]):
+          scalars["rmse"] = jnp.sqrt(scalars["loss"])
+          for nb in np.unique([
+                  int(k.split('_')[-1]) for k in scalars.keys() if '_' in k]):
+            scalars[f"rmse_{nb}"] = jnp.sqrt(scalars[f"loss_{nb}"])
       scalars["local_device_count"] = jax.local_device_count()
       scalars["device_count"] = jax.device_count()
       scalars["process_count"] = jax.process_count()
@@ -403,31 +594,37 @@ class Experiment(experiment.AbstractExperiment):
     if self.forward is None:
       self._eval_init()
 
-    del global_step  # Unused.
-    params = utils.get_first(self._params)
-    state = utils.get_first(self._network_state)
-    rng = utils.get_first(rng)
+    global_step = maybe_get_first(global_step).item()
+    params = maybe_get_first(self._params)
+    state = maybe_get_first(self._network_state)
+    if rng.ndim == 2:
+      rng = rng[0]
+
+    params = jax.tree_map(lambda x: x.copy(), params)
+
+    m2_offset = self.config.evaluation.unk_offset
+    m1_offset = self.config.evaluation.eos_offset
 
     self._valid_predictions, scalars = self._get_predictions(
-        params, state, rng,
-        utils.py_prefetch(
-            lambda: self._build_numpy_dataset_iterator("valid"), buffer_size=5))
+        params, state, rng, m2_offset, m1_offset, "valid")
     scalars["num_valid_predictions"] = len(self._valid_predictions.predictions)
 
     if self.config.evaluation.eval_also_on_test:
       self._test_predictions, test_scalars = self._get_predictions(
-          params, state, rng,
-          utils.py_prefetch(
-              lambda: self._build_numpy_dataset_iterator("test"),
-              buffer_size=5))
+          params, state, rng, m2_offset, m1_offset, "test")
       scalars["num_test_predictions"] = len(self._test_predictions.predictions)
       scalars.update({f"test_{k}": v for k, v in test_scalars.items()})
+
+    scalars = jax.tree_map(
+      lambda x: x.item() if isinstance(x, jnp.ndarray) else x, scalars)
+
+    logging.info("evaluate() - global_step: %d, %s", global_step, scalars)
 
     return scalars
 
 
 def _numpy_to_tensor_spec(arr: np.ndarray) -> tf.TensorSpec:
-  if not isinstance(arr, np.ndarray):
+  if not isinstance(arr, np.ndarray) and not isinstance(arr, jnp.ndarray):
     return tf.TensorSpec([],
                          dtype=tf.int32 if isinstance(arr, int) else tf.float32)
   elif arr.shape:
@@ -457,42 +654,47 @@ def _restore_state_to_in_memory_checkpointer(restore_path):
       mode="train", init_rng=0, config=FLAGS.config.experiment_kwargs.config)
   for attribute, key in Experiment.CHECKPOINT_ATTRS.items():
     setattr(dummy_experiment, attribute,
-            utils.bcast_local_devices(pretrained_state[key]))
+            maybe_bcast_local_devices(pretrained_state[key]))
 
   jaxline_state = dict(
       global_step=pretrained_state["global_step"],
       experiment_module=dummy_experiment)
-  snapshot = utils.SnapshotNT(0, jaxline_state)
+  snapshot = jutils.SnapshotNT(0, jaxline_state)
 
-  # Finally, seed the jaxline `utils.InMemoryCheckpointer` global dict.
-  utils.GLOBAL_CHECKPOINT_DICT["latest"] = utils.CheckpointNT(
+  # Finally, seed the jaxline `jutils.InMemoryCheckpointer` global dict.
+  jutils.GLOBAL_CHECKPOINT_DICT["latest"] = jutils.CheckpointNT(
       threading.local(), [snapshot])
 
 
 def _save_state_from_in_memory_checkpointer(
-    save_path, experiment_class: experiment.AbstractExperiment):
+        save_path, experiment_class: experiment.AbstractExperiment):
   """Saves experiment state to a checkpoint."""
   logging.info("Saving model.")
-  for checkpoint_name, checkpoint in utils.GLOBAL_CHECKPOINT_DICT.items():
+  for checkpoint_name, checkpoint in jutils.GLOBAL_CHECKPOINT_DICT.items():
     if not checkpoint.history:
       logging.info('Nothing to save in "%s"', checkpoint_name)
       continue
 
-    pickle_nest = checkpoint.history[-1].pickle_nest
-    global_step = pickle_nest["global_step"]
+    for entry in reversed(checkpoint.history):
+      try:
+        pickle_nest = entry.pickle_nest
+        global_step = pickle_nest["global_step"]
 
-    state_dict = {"global_step": global_step}
-    for attribute, key in experiment_class.CHECKPOINT_ATTRS.items():
-      state_dict[key] = utils.get_first(
-          getattr(pickle_nest["experiment_module"], attribute))
-    save_dir = os.path.join(save_path, checkpoint_name,
-                            _get_step_date_label(global_step))
-    python_state_path = os.path.join(save_dir, "checkpoint.dill")
-    os.makedirs(save_dir, exist_ok=True)
-    with open(python_state_path, "wb") as f:
-      dill.dump(state_dict, f)
-    logging.info('Saved "%s" checkpoint to %s', checkpoint_name,
-                 python_state_path)
+        state_dict = {"global_step": global_step}
+        for attribute, key in experiment_class.CHECKPOINT_ATTRS.items():
+          state_dict[key] = maybe_get_first(
+              getattr(pickle_nest["experiment_module"], attribute))
+        save_dir = os.path.join(save_path, checkpoint_name,
+                                _get_step_date_label(global_step))
+        python_state_path = os.path.join(save_dir, "checkpoint.dill")
+        os.makedirs(save_dir, exist_ok=True)
+        with open(python_state_path, "wb") as f:
+          dill.dump(state_dict, f)
+        logging.info('Saved %s checkpoint to %s',
+                     checkpoint_name, python_state_path)
+        break
+      except Exception as e:
+        print(e)
 
 
 def main(argv, experiment_class: experiment.AbstractExperiment):
@@ -503,18 +705,34 @@ def main(argv, experiment_class: experiment.AbstractExperiment):
 
   # Maybe save a model.
   save_dir = os.path.join(FLAGS.config.checkpoint_dir, "models")
+  os.makedirs(save_dir, exist_ok=True)
   if FLAGS.config.one_off_evaluate:
-    save_model_fn = lambda: None  # No need to save checkpoint in this case.
+    # No need to save checkpoint in this case.
+    def save_model_fn(): return None
   else:
     save_model_fn = functools.partial(_save_state_from_in_memory_checkpointer,
                                       save_dir, experiment_class)
 
+  def wandb_init(config):
+    if config.experiment_kwargs.config.debug and wandb is not None:
+      return None
+
+    tags = config.wandb.tags
+
+    return wandb.init(
+      project=config.wandb.project, tags=tags, config=config.to_dict(),
+      settings=wandb.Settings(**config.wandb.settings))
+
   try:
-    platform.main(experiment_class, argv)
+    engine.main(experiment_class, argv, wandb_init=wandb_init)
+  except Exception as e:
+    logging.error(traceback.format_exc())
   finally:
     save_model_fn()  # Save at the end of training or in case of exception.
 
 
 if __name__ == "__main__":
+  _disable_gpu_for_tf()
   flags.mark_flag_as_required("config")
-  app.run(lambda argv: main(argv, Experiment))  # pytype: disable=wrong-arg-types
+  # pytype: disable=wrong-arg-types
+  app.run(lambda argv: main(argv, Experiment))

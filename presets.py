@@ -26,6 +26,16 @@ def apply_presets(config: config_dict.ConfigDict,
       'norevogb': norevogb_preset,
       'dfogb': dfogb_preset,
       'sn': sorting_network_preset,
+      'adj': adjacency_preset,
+      'adja': adjacency_acyclic_preset,
+      'adju': adjacency_undirected_preset,
+      'con': is_connected_preset,
+      'cona': is_connected_acyclic_preset,
+      'conu': is_connected_undirected_preset,
+      'dist': distance_preset,
+      'dista': distance_acyclic_preset,
+      'distu': distance_undirected_preset,
+      'distau': distance_acyclic_undirected_preset,
       # Basic architecture and positional encodings
       'bignn': bignn_preset,
       'pprpos': ppr_posenc_preset,
@@ -49,7 +59,6 @@ def norevogb_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   config_ = config.experiment_kwargs.config
 
   config_.dataset_name = 'ogbg-code2-norev'
-  config_.model.gnn_config.bidirectional = True
 
   # General hyperparams (With tuning batch size 56)
   config_.optimizer.use_agc = True
@@ -68,7 +77,8 @@ def norevogb_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   config_.model.global_readout = 'cls'
   config_.model.encoder_config.attribute_dropout = 0.15
   config_.model.attention_config.dropout_p = 0.18
-  config_.model.gnn_config.k_hop = 2
+  config_.model.gnn_config.bidirectional = True
+  config_.model.gnn_config.k_hop = 3
   config_.model.gnn_config.mlp_layers = 1
 
   # Offset
@@ -81,10 +91,9 @@ def dfogb_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """Params for the data-flow centric OGB (without reversed edges)."""
   config_ = config.experiment_kwargs.config
 
-  config_.dataset_name = 'ogbg-code2-norev-df2'
+  config_.dataset_name = 'ogbg-code2-norev-df'
   config_.dataset_config.exclude_control_flow_edges = False
   config_.dataset_config.exclude_next_syntax_edges = True
-  config_.model.gnn_config.bidirectional = True
 
   # General hyperparams (With tuning batch size 56)
   config_.optimizer.use_agc = True
@@ -103,19 +112,30 @@ def dfogb_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   config_.model.global_readout = 'cls'
   config_.model.encoder_config.attribute_dropout = 0.15
   config_.model.attention_config.dropout_p = 0.185
-  config_.model.gnn_config.k_hop = 2
+  config_.model.gnn_config.bidirectional = True
+  config_.model.gnn_config.k_hop = 3
   config_.model.gnn_config.mlp_layers = 1
 
   # offset
   config_.evaluation.unk_offset = 0.75
-  config_.evaluation.eos_offset = 0.3
+  config_.evaluation.eos_offset = 0.45
+
+  # Adaptions to save memory in comparison to TPU setup
+  config_.optimizer.accumulate_gradient_k = 12
+  config_.training.batch_size = 32
+  # config_.evaluation.batch_size = 32
   return config
 
 
 def sorting_network_preset(
-    config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """Params for the sorting network dataset."""
   config = dfogb_preset(config)
+
+  # Reverse adaptions to save memory in comparison to TPU setup
+  config.experiment_kwargs.config.optimizer.accumulate_gradient_k = 8
+  config.experiment_kwargs.config.training.batch_size = 48
+  # config.experiment_kwargs.config.evaluation.batch_size = 48
 
   config.epochs = 15
 
@@ -123,7 +143,6 @@ def sorting_network_preset(
   config.experiment_kwargs.config.model.gnn_config.use_edge_attr = False
   config.experiment_kwargs.config.evaluation.max_number_of_instances = 40_000
   config.best_model_eval_metric = 'accuracy'
-  config.experiment_kwargs.config.optimizer.lr_schedule.peak_value /= 16
   config.experiment_kwargs.config.optimizer.agc_kwargs.clipping = 0.075
   config.experiment_kwargs.config.optimizer.optimizer_kwargs.weight_decay = 6e-5
   config.experiment_kwargs.config.optimizer.optimizer_kwargs.b1 = 0.7
@@ -134,6 +153,140 @@ def sorting_network_preset(
 
   config.experiment_kwargs.config.model.deg_sensitive_residual = False
   config.experiment_kwargs.config.model.posenc_config.exclude_canonical = True
+
+  # offset
+  config.experiment_kwargs.config.evaluation.unk_offset = 0
+  config.experiment_kwargs.config.evaluation.eos_offset = 0
+  return config
+
+
+def adjacency_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = sorting_network_preset(config)
+
+  config.save_checkpoint_interval = 240
+
+  config.epochs = 15  # Due to the more aggressive bucketing, this is roughly 30
+  config_ = config.experiment_kwargs.config
+
+  config_.dataset_name = 'adj_c'
+  config_.evaluation.max_number_of_instances = -1
+  config.best_model_eval_metric = 'f1'
+
+  config_.optimizer.accumulate_gradient_k = 1
+
+  config_.model.posenc_config.exclude_canonical = True
+  # config_.model.global_readout = 'sum_n'
+
+  config_.dataset_config.bucket_boundaries = (127, 255, 511)
+  config_.dataset_config.bucket_batch_size_factors = (8, 4, 2, 1)
+
+  # Offset - will be auto tuned
+  # config_.training.batch_size = 24
+  config_.evaluation.unk_offset = 0.0
+  config_.evaluation.eos_offset = 0.0
+
+  config_.evaluation.batch_size = 128
+  # config_.evaluation.batch_size = 24
+  return config
+
+
+def adjacency_acyclic_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = adjacency_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'adj_ca'
+
+  return config
+
+
+def adjacency_undirected_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = adjacency_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'adj_c_u'
+
+  return config
+
+
+def is_connected_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = adjacency_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'con_c'
+
+  return config
+
+
+def is_connected_acyclic_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = is_connected_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'con_ca'
+
+  return config
+
+
+def is_connected_undirected_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = is_connected_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'con_c_u'
+
+  return config
+
+
+def distance_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = adjacency_preset(config)
+
+  config.save_checkpoint_interval = 600
+
+  config_ = config.experiment_kwargs.config
+
+  config_.dataset_name = 'dist_c'
+  config_.evaluation.batch_size = 64
+
+  config.best_model_eval_metric = 'rmse'
+  config.best_model_eval_metric_higher_is_better = False
+
+  return config
+
+
+def distance_acyclic_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = distance_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'dist_ca'
+
+  return config
+
+
+def distance_undirected_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = distance_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'dist_c_u'
+
+  return config
+
+
+def distance_acyclic_undirected_preset(
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+  """Params for the sorting network dataset."""
+  config = distance_preset(config)
+
+  config.experiment_kwargs.config.dataset_name = 'dist_ca_u'
+
   return config
 
 
@@ -141,7 +294,7 @@ def bignn_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """Params for the bidirectional GNN."""
   config_ = config.experiment_kwargs.config.model.gnn_config
   config_.gnn_type = 'gnn'
-  config_.k_hop = 2
+  config_.k_hop = 3
   config_.se = 'gnn'
   config_.mlp_layers = 1
   config_.tightening_factor = 2
@@ -153,69 +306,44 @@ def bignn_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
 
 def ppr_posenc_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """Personalized Page Rank positional encodings."""
+  exclude_canonical = 'ogb' not in config.experiment_kwargs.config.dataset_name
   posenc_config = config_dict.ConfigDict(
       dict(
           posenc_type='ppr',
           do_also_reverse=True,
-          ppr_restart_probaility=0.1,
+          ppr_restart_probability=0.1,
           relative_positional_encodings=True,
-          random_walk_steps=-1,
-          exclude_canonical=True))
+          exclude_canonical=exclude_canonical,
+          random_walk_steps=-1))
   config.experiment_kwargs.config.model.posenc_config = posenc_config
   return config
 
 
 def random_walk_posenc_preset(
-    config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """Random Walk positional encodings."""
-  config_ = config.experiment_kwargs.config
-
+  exclude_canonical = 'ogb' not in config.experiment_kwargs.config.dataset_name
   posenc_config = config_dict.ConfigDict(
       dict(
           posenc_type='rw',
           do_also_reverse=True,
-          ppr_restart_probaility=0.05,
+          ppr_restart_probability=0.05,
           relative_positional_encodings=False,
-          random_walk_steps=3,
-          exclude_canonical=True))
-  config_.model.posenc_config = posenc_config
+          exclude_canonical=exclude_canonical,
+          random_walk_steps=3))
+  config.experiment_kwargs.config.model.posenc_config = posenc_config
   return config
 
 
 def magnetic_laplacian_preset(
-    config: config_dict.ConfigDict) -> config_dict.ConfigDict:
-  """Magnetic Laplacian positional encodings."""
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   config_ = config.experiment_kwargs.config
-
-  # General hyperparams (With tuning batch size 56)
-  config_.optimizer.use_agc = True
-  config_.optimizer.optimizer_kwargs.weight_decay = 7.5e-5
-  config_.optimizer.optimizer_kwargs.b1 = 0.65
-  config_.optimizer.optimizer_kwargs.b2 = 0.91
-  config_.optimizer.lr_schedule.peak_value = 2e-3 / 56  # 2.5e-3 / 56
-  config_.optimizer.lr_schedule.init_value = 7e-6 / 56
-  config_.optimizer.lr_schedule.end_value = 2e-9 / 56
-  config_.optimizer.agc_kwargs.clipping = 0.1
-
-  # Model params
-  config_.model.attention_config.with_attn_dropout = False
-  config_.model.activation = 'gelu'
-  config_.model.attention_config.with_bias = True
-  config_.model.global_readout = 'cls'
-  config_.model.encoder_config.attribute_dropout = 0.15
-  config_.model.attention_config.dropout_p = 0.175
-  config_.model.gnn_config.k_hop = 2
-  config_.model.gnn_config.mlp_layers = 1
-
-  # offset
-  config_.evaluation.unk_offset = 0.75
-  config_.evaluation.eos_offset = 0.3
 
   posenc_config = config_.model.posenc_config
   posenc_config.posenc_type = 'maglap'
-  posenc_config.exclude_canonical = False
+  # posenc_config.exclude_canonical = False
   posenc_config.relative_positional_encodings = False
-  posenc_config.top_k_eigenvectors = 50
+  posenc_config.top_k_eigenvectors = 15
   posenc_config.maglap_q = 0.1
   posenc_config.maglap_q_absolute = False
   posenc_config.excl_k_eigenvectors = 0
@@ -224,10 +352,10 @@ def magnetic_laplacian_preset(
   posenc_config.maglap_transformer = True
   posenc_config.maglap_use_signnet = True
   posenc_config.maglap_use_gnn = True
-  posenc_config.maglap_norm_comps_sep = True
-  posenc_config.maglap_l2_norm = False
-  posenc_config.maglap_dropout_p = 0.05
-  posenc_config.maglap_sign_rotate = True
+  posenc_config.maglap_norm_comps_sep = False
+  posenc_config.maglap_l2_norm = True
+  posenc_config.maglap_dropout_p = 0.10
+  posenc_config.maglap_sign_rotate = False
 
   if 'sn-' in config.experiment_kwargs.config.dataset_name:
     config_.optimizer.use_agc = True
@@ -237,20 +365,27 @@ def magnetic_laplacian_preset(
     config_.optimizer.lr_schedule.peak_value = 5e-4 / 48
     config_.optimizer.lr_schedule.init_value = 1.5e-7 / 48
     config_.optimizer.lr_schedule.end_value = 1.5e-9 / 48
-    config_.optimizer.agc_kwargs.clipping = 0.025
+    config_.optimizer.agc_kwargs.clipping = 0.005
 
-    posenc_config.top_k_eigenvectors = 50
+    posenc_config.top_k_eigenvectors = 25
     posenc_config.relative_positional_encodings = False
-    posenc_config.maglap_q = 0.25  # 1e-4
-    posenc_config.maglap_q_absolute = False  # True
+    posenc_config.maglap_q = 0.25
+    posenc_config.maglap_q_absolute = False
     posenc_config.maglap_transformer = True
     posenc_config.maglap_use_gnn = False
     posenc_config.maglap_norm_comps_sep = False
     posenc_config.maglap_l2_norm = True
-    posenc_config.maglap_dropout_p = 0.05
-    posenc_config.maglap_use_signnet = True
+    posenc_config.maglap_dropout_p = 0.15
+    posenc_config.maglap_use_signnet = False
+    posenc_config.maglap_sign_rotate = True
 
-    config_.model.attention_config.with_posenc_residual = True
+  if 'dist' in config.experiment_kwargs.config.dataset_name:
+    posenc_config.top_k_eigenvectors = 16
+    config_.model.global_readout = 'sum_n'  # Avoid adding a new virtual node
+    posenc_config.maglap_use_gnn = False
+    posenc_config.maglap_l2_norm = True
+    posenc_config.maglap_sign_rotate = True
+    posenc_config.maglap_use_signnet = False
 
   return config
 
@@ -266,7 +401,7 @@ def laplacian_preset(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
 
 
 def bucket_by_size_preset(
-    config: config_dict.ConfigDict) -> config_dict.ConfigDict:
+        config: config_dict.ConfigDict) -> config_dict.ConfigDict:
   """To batch graphs of similar size together."""
   config.experiment_kwargs.config.dataset_config.do_bucket_by_size = True
   return config
