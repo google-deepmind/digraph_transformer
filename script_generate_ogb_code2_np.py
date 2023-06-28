@@ -210,13 +210,6 @@ def main(*args, dataset_name='ogbg-code2', **kwargs):
     topk_node_values = node_value_counter.most_common(11_972)
     node_values_to_idx = {k: v for v, (k, _) in enumerate(topk_node_values)}
 
-    meta = os.path.join(_OUT_PATH.value, 'train', 'meta.npz')
-    metadata = np.load(meta, allow_pickle=True)["data"].item()
-
-    node_values_to_idx = metadata['node_values_to_idx']
-    node_type_to_idx = metadata['node_type_to_idx']
-    edge_name_to_idx = metadata['edge_name_to_idx']
-
     def node_values_to_idx_with_default(value):
       if value in node_values_to_idx:
         return node_values_to_idx[value]
