@@ -32,7 +32,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jaxline import experiment
-# from jaxline import platform
+from jaxline import platform
 from jaxline import utils as jutils
 import jraph
 import numpy as np
@@ -43,7 +43,6 @@ import tree
 
 # pylint: disable=g-bad-import-order
 import dataset_utils
-import engine
 import models
 import ogb_utils
 from utils import tp_fn_fp, prec_rec_f1
@@ -713,18 +712,8 @@ def main(argv, experiment_class: experiment.AbstractExperiment):
     save_model_fn = functools.partial(_save_state_from_in_memory_checkpointer,
                                       save_dir, experiment_class)
 
-  def wandb_init(config):
-    if config.experiment_kwargs.config.debug and wandb is not None:
-      return None
-
-    tags = config.wandb.tags
-
-    return wandb.init(
-      project=config.wandb.project, tags=tags, config=config.to_dict(),
-      settings=wandb.Settings(**config.wandb.settings))
-
   try:
-    engine.main(experiment_class, argv, wandb_init=wandb_init)
+    platform.main(experiment_class, argv)
   except Exception as e:
     logging.error(traceback.format_exc())
   finally:

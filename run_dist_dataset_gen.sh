@@ -46,15 +46,6 @@ python "${SCRIPT_DIR}"/script_generate_distance_np.py \
     --n_train=16,18 --n_valid=18,20 --n_test=20,28
 
 python "${SCRIPT_DIR}"/script_generate_distance_np.py \
-    --out_path=${DATA_ROOT}/distance --acyclic --connected --target=undirected \
-    --n_train=16,18 --n_valid=18,20 --n_test=20,28
-
-python "${SCRIPT_DIR}"/script_generate_distance_np.py \
-    --out_path=${DATA_ROOT}/distance --connected --target=undirected \
-    --n_train=16,18 --n_valid=18,20 --n_test=20,28
-
-
-python "${SCRIPT_DIR}"/script_generate_distance_np.py \
     --out_path=${DATA_ROOT}/distance --acyclic --connected \
     --n_train=16,64 --n_valid=64,72 --n_test=72,84
 

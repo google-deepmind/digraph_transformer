@@ -1,6 +1,0 @@
-# @package _global_
-
-hydra:
-  sweeper:
-    params:
-      config.random_seed: 87498,45925,15795,60263,44131,37194,6265,54886,76820,860

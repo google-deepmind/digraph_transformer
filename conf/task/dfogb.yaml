@@ -1,9 +1,0 @@
-# @package _global_
-
-config:
-  task: dfogb
-  data: ./data/ogb
-  wandb:
-    project: digt-code2
-    settings:
-      code_dir: .

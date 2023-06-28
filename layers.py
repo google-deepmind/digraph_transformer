@@ -13,8 +13,7 @@
 # limitations under the License.
 """Mostly standard comnponents or adaptions to mimic PyTorch's behaviour."""
 import dataclasses
-from functools import partial
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 import warnings
 
 import haiku as hk

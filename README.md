@@ -48,26 +48,55 @@ substantial amount of main memory (> 50 GB).
 
 ## Train models
 
-For training the models, we provide convenient [hydra](https://hydra.cc/)
-configurations in `./conf`.
-
 For training the models with Magnetic Laplacian positional encodings you
-may use:
-- Positional encodings playground: `python hydra_runner.py -m +task=adj,adja,con,cona,dist,dista,distu,distau +model=maglap` to sweep over the tasks
-  - `adj`/`adja` predicting the adjacency for regular and acyclic graphs
-  - `con`/`cona` predicting the connectedness for regular and acyclic graphs
-  - `dist`/`dista` directed distance for regular and acyclic graphs
-  - `distu`/`distau` undirected distance for regular and acyclic graphs
-- Sorting network: `python hydra_runner.py -m +task=sn +model=maglap`
-- OGB Code2 dataset: `python hydra_runner.py -m +task=dfogb +model=maglap`
+may use the commands detailed in this sections. For other models you mainly
+need to adjust the `maglappos` preset.
 
-See `conf/reruns` for configurations about randomized reruns. For OGB Code2 we
-used `conf/reruns/10seed.yaml`.
+You may monitor the run via the tensorboard logs in the respective checkpoint
+directory.
 
-If you have weights and biases (`wandb`) installed, the experiment will
-automatically log results there. Otherwise, see the tensorboard logs.
+### Positional Encodings Playground
 
-### Evaluating pretrained models
+```bash
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/distance \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/distance/checkpoints/ \
+    --config.experiment_kwargs.config.model.gnn_config.se=
+```
+
+`TASK` is the respective task of the playground (e.g., `export TASK=adj`):
+- `adj`/`adja` predicting the adjacency for regular/acyclic graphs
+- `con`/`cona` predicting the connectedness for regular/acyclic graphs
+- `dist`/`dista` directed distance for regular/acyclic graphs
+- `distu`/`distau` undirected distance for regular/acyclic graphs
+
+### Sorting Network
+
+```bash
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/sorting_network \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/sorting_network/checkpoints/ \
+    --config.experiment_kwargs.config.model.gnn_config.se=
+```
+
+### OGB Code2
+
+```bash
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/ogb \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/ogb/checkpoints/ \
+```
+
+## Evaluating pretrained models
 
 To run, e.g., pretrained models for OGB you may run
 

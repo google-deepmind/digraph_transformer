@@ -23,4 +23,3 @@ graphviz>=0.20.1
 # python_graphs
 git+https://github.com/google-research/python-graphs.git@0201fb090b9224dfb1a9a05ce836e9ef6da8ccc9
 tbb>=2021.7.0
-hydra-core>=1.3.2

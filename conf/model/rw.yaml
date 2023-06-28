@@ -1,9 +1,0 @@
-# @package _global_
-default:
-  - override 
-
-config:
-  presets: bignn,rwpos,bbs
-  wandb:
-    tags: 
-      - rw

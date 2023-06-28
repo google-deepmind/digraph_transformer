@@ -1,9 +1,0 @@
-defaults:
-  - _self_
-
-config:
-  random_seed: 1000
-  checkpoint: ./data/checkpoint
-  mode: train_eval_multithreaded
-
-overwrite: ~
