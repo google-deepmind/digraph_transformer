@@ -99,7 +99,10 @@ def _pad_to_next_power_of_two(graph: jraph.GraphsTuple,
     return padded
 
   if cfg.name.startswith('dist'):
-    tree_nodes_pad = functools.partial(pad, n_pad=int(n_node))
+    def tree_nodes_pad(nodes):
+      if nodes.shape[-1] == 0:
+        return pad(nodes, n_pad=int(n_node))
+      return pad(nodes, n_pad=pad_n_node)
     tree_edges_pad = functools.partial(pad, n_pad=int(n_edge))
 
     def tree_globs_pad(globals_):

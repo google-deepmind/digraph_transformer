@@ -51,7 +51,7 @@ _N_TEST = flags.DEFINE_list(
 
 
 maglap_configs = [
-  dict(k=16, k_excl=0, q=0.25,
+  dict(k=16, k_excl=0, q=0.1,
        q_absolute=False, norm_comps_sep=False,
        sign_rotate=True, use_symmetric_norm=True),
   dict(k=16, k_excl=0, q=0,

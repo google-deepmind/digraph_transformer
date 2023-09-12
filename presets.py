@@ -379,7 +379,9 @@ def magnetic_laplacian_preset(
     posenc_config.maglap_use_signnet = False
     posenc_config.maglap_sign_rotate = True
 
-  if 'dist' in config.experiment_kwargs.config.dataset_name:
+  if ('adj' in config.experiment_kwargs.config.dataset_name or
+      'con' in config.experiment_kwargs.config.dataset_name or
+      'dist' in config.experiment_kwargs.config.dataset_name):
     posenc_config.top_k_eigenvectors = 16
     config_.model.global_readout = 'sum_n'  # Avoid adding a new virtual node
     posenc_config.maglap_use_gnn = False
