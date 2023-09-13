@@ -3,6 +3,12 @@
 This repository contains the accompanying code for the paper Transformers Meet
 Directed Graphs.
 
+For external resources (not published by DeepMind), please see the 
+[homepage of TU Munich](https://www.cs.cit.tum.de/daml/digraph-transformer/).
+
+*Disclaimer: The provided scripts are for illustrative purposes. Due to the
+single-machine setup the scalability is limited.*
+
 ## Setup
 
 You can set up Python virtual environment (you might need to install the
@@ -22,78 +28,99 @@ Note that you will also need the headers of libtbb and graphviz:
 sudo apt install libtbb-dev graphviz-dev
 ```
 
-## Sorting Networks
+The default configurations for the eigenvectors of the (Magnetic) Laplacian are
+being precomputed. For all other configurations, the dataloader will use
+numba's multithreading capabilities for the eigendecomposition. This might not
+be desired if using a multi-threaded backend for numpy.
 
-We now explain how to reproduce the results using the transformer with magnetic
-laplacian positional encodings on the sorting networks dataset.
+## Generate datasets
 
-*Disclaimer: This script is provided for illustrative purposes. Due to the
-single machine setup the scalability is limited.*
+We provide utility scripts to generate the used datasets, where `DATA_PATH` is
+a local storage location of your choice:
+- Positional encodings playground: `/bin/bash run_sn_dataset_gen.sh -r ${DATA_PATH}`
+- Sorting network: `/bin/bash run_sn_dataset_gen.sh -r ${DATA_PATH}`
+- OGB Code2 dataset: `/bin/bash run_ogb_dataset_gen.sh -r ${DATA_PATH}`
 
-### Generate dataset
+Note that `distance` is used as an identifyer for the positional encodings
+playground in the code base. Moreover, note that loading the
+`graphidx2code.json.gz` provided by OGB will require a
+substantial amount of main memory (> 50 GB).
 
-Where `DATA_PATH` is a local storage location of your choice.
+## Train models
 
-To generate the dataset, please run:
+For training the models with Magnetic Laplacian positional encodings you
+may use the commands detailed in this sections. For other models you mainly
+need to adjust the `maglappos` preset.
+
+You may monitor the run via the tensorboard logs in the respective checkpoint
+directory.
+
+### Positional Encodings Playground
 
 ```bash
-/bin/bash run_sn_dataset_gen.sh -r ${DATA_PATH}
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/distance \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/distance/checkpoints/ \
+    --config.experiment_kwargs.config.model.gnn_config.se=
 ```
 
-### Training the model
+`TASK` is the respective task of the playground (e.g., `export TASK=adj`):
+- `adj`/`adja` predicting the adjacency for regular/acyclic graphs
+- `con`/`cona` predicting the connectedness for regular/acyclic graphs
+- `dist`/`dista` directed distance for regular/acyclic graphs
+- `distu`/`distau` undirected distance for regular/acyclic graphs
 
-After dataset generation, to train a model, please run:
+### Sorting Network
 
 ```bash
-/bin/bash run_sn_training.sh -r ${DATA_PATH}
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/sorting_network \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/sorting_network/checkpoints/ \
+    --config.experiment_kwargs.config.model.gnn_config.se=
 ```
 
-### Evaluating the model
-
-With a trained model, please run:
+### OGB Code2
 
 ```bash
-/bin/bash run_sn_eval.sh -r ${DATA_PATH}  -c ${MODEL_PATH}
+python experiment.py \
+    --jaxline_mode=train_eval_multithreaded \
+    --config=./config.py:${TASK},bignn,maglappos,bbs \
+    --config.experiment_kwargs.config.data_root=${DATA_PATH}/ogb \
+    --config.random_seed=1000 \
+    --config.checkpoint_dir=${DATA_PATH}/ogb/checkpoints/ \
 ```
-```
 
-For example, our `MODEL_PATH` was `"~/checkpoints/models/best"` (i.e. pointing
-to a folder containing a `checkpoint.dill` file).
+## Evaluating pretrained models
 
-## Open Graph Benchmark Code2
+To run, e.g., pretrained models for OGB you may run
 
-To generate the dataset with the data-flow centric graph construction, we
-provide the `dataflow_parser.py`. This parser can be used to convert python
-source code into graphs (source code is provided by OGB in
-`<ogb_root>/ogbg_code2/mapping/graphidx2code.json`). To run this module you
-also need to install `pip3 install python-graphs` (at the time of usage there
-was an issue with bare "*" as function parameters that we fixed manually).
-
-As you can see from the configuration, we took the 11,973 most frequent
-attributes (all words that appear at least 100 times in the dataset). All other
-node/edge attributes/features are exhaustively mapped to tokens.
-
-You first need to convert the dataset (see
-`script_generate_sorting_network_np.py` for a possible template). Thereafter,
-you can use to train the model using with eigenvectors of the Magnetic
-Laplacian as positional encodings:
 ```bash
-python "${SCRIPT_DIR}"/experiment.py \ --jaxline_mode="train" \
---config="${SCRIPT_DIR}/config.py:dfogb,bignn,maglappos,bbs" \
---config.random_seed=${MODEL_SEED} \ --config.checkpoint_dir=${CHECKPOINT_DIR} \
---config.experiment_kwargs.config.data_root=${DATA_ROOT}
+python ./experiment.py \
+    --jaxline_mode="eval" \
+    --config="./config.py:dfogb,bignn,maglappos,bbs" \
+    --config.restore_path=${RESTORE_PATH} \
+    --config.experiment_kwargs.config.data_root=${DATA_ROOT}/ogb \
+    --config.one_off_evaluate=True
 ```
-For more details see also also `run_sn_training.sh`.
+
+where `RESTORE_PATH` is the path to the model's folder (i.e., the parent of
+the `*.dill` file). `DATA_ROOT` is the location of the preprocessed data.
 
 ## Citation
 
 To cite this work:
-
 ```latex
-@article{deepmind2022magnetic_laplacian,
-  author = {Geisler, Simon and Paduraru, Cosmin and Li, Yujia and Cemgil, Taylan},
+@inproceedings{deepmind2023digraph_transformer,
+  author = {Geisler, Simon and Li, Yujia and Mankowitz, Daniel and Cemgil, Taylan and G\"unnemann, Stephan and Paduraru, Cosmin},
   title = {Transformers Meet Directed Graphs},
-  year = {2022},
+  year = {2023},
+  booktitle = {International Conference on Machine Learning, {ICML}},
 }
 ```
 

@@ -12,28 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Generates the sorting network dataset."""
-import itertools
 import os
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Union
 
 from absl import app
 from absl import flags
 from absl import logging
 import jraph
-import networkx as nx
 import numba
 import numpy as np
 import tqdm
 
+from script_postcompute_eigedecomp import precalc_and_append
+
 np.random.seed(42)
 
-_OUT_PATH = flags.DEFINE_string('out_path', '~/sorting_network',
+_OUT_PATH = flags.DEFINE_string('out_path', '~/data/sorting_network',
                                 'The path to write datasets to.')
 _SHARD_SIZE = flags.DEFINE_integer(
     'shard_size', 10_000, 'The number of times to store in each file.')
+_REVERSE = flags.DEFINE_boolean('reverse', True,
+                                'If true also reverse test samples')
 
 # Instructions with lengths to put in which dataset and how many sorting
-# networks shall be generated (exlcueding random sampling over topo. orders)
+# networks shall be generated (2x for train, 3x for valid and test)
 SPLITS = [
     # (split, seq_lens, n_generation_trials)
     ('train', [7, 8, 9, 10, 11], 400_000),
@@ -47,6 +49,14 @@ BATCH_SIZE = 500
 # Upper limit on operators
 MAX_OPERATORS = 512
 
+maglap_configs = [
+  dict(k=25, k_excl=0, q=0.25,
+       q_absolute=False, norm_comps_sep=False,
+       sign_rotate=True, use_symmetric_norm=True),
+  dict(k=25, k_excl=0, q=0,
+       q_absolute=False, norm_comps_sep=False,
+       sign_rotate=True, use_symmetric_norm=True)
+]
 
 @numba.jit(nopython=False)
 def get_test_cases(seq_len: int) -> np.ndarray:
@@ -66,6 +76,8 @@ def generate_sorting_network(seq_len: int, max_operators: int = 512):
     i, j = sorted(np.random.choice(unsorted_locations, size=2, replace=False))
     if (i, j) == last_operator:
       continue
+    if i not in unsorted_locations and j not in unsorted_locations:
+      continue
     last_operator = (i, j)
     operators.append((i, j))
 
@@ -83,7 +95,19 @@ def generate_sorting_network(seq_len: int, max_operators: int = 512):
       return False, operators, test_cases
 
 
-def operators_to_graphstuple(operators: List[Tuple[int, int]],
+@numba.jit(nopython=False)
+def test_network(operators, seq_len):
+  test_cases = get_test_cases(seq_len)
+  for i, j in operators.astype(np.int64):
+    test_cases[(i, j), :] = np.sort(test_cases[(i, j), :], axis=0)
+    test_cases = np.unique(test_cases, axis=1)
+    if test_cases.shape[1] == seq_len + 1:
+      return True, test_cases
+  return False, test_cases
+
+
+def operators_to_graphstuple(operators: Union[List[Tuple[int, int]],
+                                              np.ndarray],
                              seq_len: int) -> jraph.GraphsTuple:
   """Converts the list of "operators" to a jraph.graphstuple."""
   num_nodes = len(operators)
@@ -122,51 +146,19 @@ def operators_to_graphstuple(operators: List[Tuple[int, int]],
       globals=np.array([], dtype=np.float32))
 
 
-def random_topological_sorts_of_operators(operators,
-                                          seq_len,
-                                          max_orders=20,
-                                          from_choice=1_000):
-  """Generate/sample random topological sorts."""
-  di_graph = nx.DiGraph()
-  loc = {i: -1 for i in range(seq_len)}
-  for idx, (i, j) in enumerate(operators):
-    if loc[i] >= 0:
-      di_graph.add_edge(loc[i], idx)
-    if loc[j] >= 0:
-      di_graph.add_edge(loc[j], idx)
-    loc[i] = idx
-    loc[j] = idx
-
-  sub = set(
-      np.random.choice(np.arange(from_choice), max_orders,
-                       replace=False).flatten())
-  orders = itertools.islice(nx.all_topological_sorts(di_graph), from_choice)
-
-  def sort(operators, order):
-    return [operators[el] for el in order]
-
-  return (sort(operators, order) for i, order in enumerate(orders) if i in sub)
-
-
 def generate_sorting_network_batch(
     seq_len: int,
     batch: int,
-    max_operators: int = 512,
-    sample_tological_sorts=False,
-    max_orders=10,
-    from_choice=1_000) -> List[jraph.GraphsTuple]:
+    max_operators: int = 512
+  ) -> List[jraph.GraphsTuple]:
   """Generates batch graphs in parallel."""
   graph_tuples = []
   for _ in numba.prange(batch):
     success, operators, _ = generate_sorting_network(
         seq_len, max_operators=max_operators)
     if success:
-      if not sample_tological_sorts:
-        graph_tuples.append(operators_to_graphstuple(operators, seq_len))
-      else:
-        for operator_order in random_topological_sorts_of_operators(
-            operators, seq_len, max_orders=max_orders, from_choice=from_choice):
-          graph_tuples.append(operators_to_graphstuple(operator_order, seq_len))
+      graph_tuples.append(operators_to_graphstuple(operators, seq_len))
+      graph_tuples[-1] = precalc_and_append(graph_tuples[-1], maglap_configs)
   return graph_tuples
 
 
@@ -182,27 +174,26 @@ def main(argv: Sequence[str]) -> None:
     file_path = os.path.join(base_path, split)
     os.makedirs(file_path, exist_ok=True)
 
-    sample_tological_sorts = split != 'train'
-
     sample_count = 0
     buffer = []
     start_id = id_
-    for _ in tqdm.tqdm(range(n_generation_trials // BATCH_SIZE), desc=split):
+    n_batches = n_generation_trials // BATCH_SIZE
+    for batch_idx in tqdm.tqdm(range(n_batches), desc=split):
       seq_len = np.random.choice(seq_lens, 1).item()
       graphs = generate_sorting_network_batch(
           seq_len,
           BATCH_SIZE,
-          MAX_OPERATORS,
-          sample_tological_sorts=sample_tological_sorts)
+          MAX_OPERATORS)
 
-      sample_count += 2 * len(graphs)
+      sample_count += (3 if _REVERSE.value and split != 'train' else
+                       2) * len(graphs)
 
       for graph in graphs:
         buffer.append(
             (graph, np.array([True]), np.array([True]), np.array(id_)))
         id_ += 1
         # Remove last operation to generate an incorrect sorting network
-        graph = jraph.GraphsTuple(
+        graph_ = jraph.GraphsTuple(
             nodes=dict(node_feat=graph.nodes['node_feat'][:-1]),
             edges=np.array([], dtype=np.float32),
             # It is very unlikely that last operation still operates on inputs
@@ -211,11 +202,21 @@ def main(argv: Sequence[str]) -> None:
             n_node=graph.n_node - 1,
             n_edge=graph.n_edge - 2,
             globals=np.array([], dtype=np.float32))
+
         buffer.append(
-            (graph, np.array([True]), np.array([True]), np.array(id_)))
+            (graph_, np.array([False]), np.array([False]), np.array(id_)))
         id_ += 1
 
-      if len(buffer) >= _SHARD_SIZE.value:
+        if _REVERSE.value and split != 'train':
+          operators = graph.nodes['node_feat'][::-1, 1:]
+          is_correct, _ = test_network(operators, seq_len)
+          graph_ = operators_to_graphstuple(operators, seq_len)
+
+          buffer.append((graph_, np.array([is_correct]),
+                         np.array([is_correct]), np.array(id_)))
+          id_ += 1
+
+      if len(buffer) >= _SHARD_SIZE.value or batch_idx == n_batches - 1:
         file_name = os.path.join(file_path, f'{start_id}_{id_ - 1}.npz')
         np.savez_compressed(file_name, data=np.array(buffer, dtype='object'))
         logging.info('Wrote %d to %s', len(buffer), file_name)

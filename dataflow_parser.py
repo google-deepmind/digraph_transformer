@@ -226,7 +226,7 @@ class OGB_ASTWalker(ast.NodeVisitor):  # pylint: disable=invalid-name
     self.stack = []
     self.nodes = []
 
-  def generic_visit(self, node: ast.Node):
+  def generic_visit(self, node: ast.AST):
     # encapsulate all node features in a dict
     self.nodes.append({
         'type': type(node).__name__,
@@ -296,7 +296,7 @@ def get_program_graph(program: Union[str, ast.AST]):
   for node in control_flow_graph.get_enter_control_flow_nodes():
     analysis.visit(node)
 
-  # Add control flow edges (NEXT_SYNTAX) - as orginially done by python graphs
+  # Add control flow edges (NEXT_SYNTAX) - as originally done by python graphs
   # for CFG_NEXT.
   for control_flow_node in control_flow_graph.get_control_flow_nodes():
     instruction = control_flow_node.instruction
@@ -598,8 +598,8 @@ class ControlFlowVisitor(control_flow.ControlFlowVisitor):
     ][0]
     field, (_, predecessor_list, successor_list) = children_order
 
-    assert not predecessor_list[0], 'First entrty cannot have predecessor'
-    assert not successor_list[-1], 'Last entrty cannot have successor'
+    assert not predecessor_list[0], 'First entry cannot have predecessor'
+    assert not successor_list[-1], 'Last entry cannot have successor'
 
     entry_block = current_block
 

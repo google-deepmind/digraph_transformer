@@ -31,12 +31,28 @@ Tensor = Union[np.ndarray, jnp.DeviceArray]
 EPS = 1e-8
 
 
+def tp_fn_fp(prediction, target, mask=None):
+  if mask is None:
+    mask = jnp.ones_like(target)
+  tp = ((prediction == target) & (prediction == 1) & mask).sum()
+  fn = ((prediction != target) & (prediction == 0) & mask).sum()
+  fp = ((prediction != target) & (prediction == 1) & mask).sum()
+  return tp, fn, fp
+
+
+def prec_rec_f1(tp, fn, fp):
+  precision = tp / jnp.clip(tp + fp, a_min=1)
+  recall = tp / jnp.clip(tp + fn, a_min=1)
+  f1 = 2 * precision * recall / jnp.clip(precision + recall, a_min=1)
+  return precision, recall, f1
+
+
 def softmax_cross_entropy_loss(
     logits: Tensor,
     targets: Tensor,
     n_classes: int,
     only_punish_first_end_of_sequence_token: bool = False) -> jnp.DeviceArray:
-  """Calculation of softmax loss for sequence of predicitons/tokens."""
+  """Calculation of softmax loss for sequence of predictions/tokens."""
   targets_one_hot = jax.nn.one_hot(targets, n_classes)
   logits = jax.nn.log_softmax(logits)
   elem_loss = -jnp.sum(targets_one_hot * logits, axis=-1)
@@ -66,7 +82,7 @@ def dense_random_walk_matrix(graph: jraph.GraphsTuple,
     reverse: If True the the graph is reversed. Default False.
 
   Returns:
-    tensor of shape [b, n, n] containing the random walk probailitities
+    tensor of shape [b, n, n] containing the random walk probabilities
   """
   batch, n_nodes = graph.nodes.shape[:2]
 
@@ -84,7 +100,7 @@ def dense_random_walk_matrix(graph: jraph.GraphsTuple,
   assign = jax.vmap(lambda a, s, r, d: a.at[s, r].add(d[s]))
   adj = assign(adj, senders, receivers, inv_deg)
   # Once implemented swap next line with: adj = jnp.fill_diagonal(adj, deg < 1)
-  adj = adj.at[:, jnp.arange(n_nodes), jnp.arange(n_nodes)].set(deg < 1)
+  adj = adj.at[:, jnp.arange(n_nodes), jnp.arange(n_nodes)].add(deg < 1)
 
   return adj
 
@@ -102,7 +118,7 @@ def k_step_random_walk(graph: jraph.GraphsTuple,
     reverse: If True the the graph is reversed. Default False.
 
   Returns:
-    tensor of shape [b, n, n, k {+1}] containing the random walk probailitities
+    tensor of shape [b, n, n, k {+1}] containing the random walk probabilities
   """
   transition_probabilities = dense_random_walk_matrix(graph, reverse)
 
@@ -113,7 +129,7 @@ def k_step_random_walk(graph: jraph.GraphsTuple,
     rw_probabilities = rw_probabilities @ transition_probabilities
     output.append(rw_probabilities)
 
-  if ppr_restart_p is not None:
+  if ppr_restart_p:
     output.append(exact_ppr_from_trans(transition_probabilities, ppr_restart_p))
 
   output = jnp.stack(output, axis=-1)
@@ -131,7 +147,7 @@ def exact_ppr(graph: jraph.GraphsTuple,
     reverse: If True the the graph is reversed. Default False.
 
   Returns:
-    tensor of shape [b, n, n] containing the random walk probailitities
+    tensor of shape [b, n, n] containing the random walk probabilities
   """
   assert restart_p >= 0 and restart_p <= 1, 'Restart prob. must be in [0, 1]'
 
@@ -150,11 +166,43 @@ def exact_ppr_from_trans(transition_prob: Tensor,
     restart_p: the personalized page rank restart probability. Default 0.2.
 
   Returns:
-    tensor of shape [b, n, n] containing the random walk probailitities
+    tensor of shape [b, n, n] containing the random walk probabilities
   """
   n_nodes = transition_prob.shape[-1]
   rw_matrix = jnp.eye(n_nodes) + (restart_p - 1) * transition_prob
   return restart_p * jnp.linalg.inv(rw_matrix)
+
+
+def svd_encodings(graph: jraph.GraphsTuple, rank: int) -> Tensor:
+  """SVD encodings following Hussain et al., Global Self-Attention as
+  a Replacement for Graph Convolution, KDD 2022.
+
+  Args:
+      graph (jraph.GraphsTuple): to obtain the adjacency matrix.
+      rank (int): for low rank approximation.
+
+  Returns:
+      Tensor: positional encodings.
+  """
+  batch, n_nodes = graph.nodes.shape[:2]
+  senders = graph.senders
+  receivers = graph.receivers
+
+  adj = jnp.zeros((batch, n_nodes, n_nodes), dtype=jnp.float32)
+  assign = jax.vmap(lambda a, s, r, d: a.at[s, r].add(d[s]))
+  adj = assign(adj, senders, receivers, jnp.ones_like(senders))
+
+  U, S, Vh = jax.lax.linalg.svd(adj)
+
+  V = jnp.conjugate(jnp.transpose(Vh, axes=(0, 2, 1)))
+  UV = jnp.stack((U, V), axis=-2)
+
+  S = S[..., :rank]
+  UV = UV[..., :rank]
+
+  UV = UV * jnp.sqrt(S)[:, None, None, :]
+
+  return UV.reshape(adj.shape[:-1] + (-1,))
 
 
 # Necessary to work around numbas limitations with specifying axis in norm and
@@ -188,7 +236,7 @@ def eigv_magnetic_laplacian_numba(
     padded_nodes_size: int, k: int, k_excl: int, q: float, q_absolute: bool,
     norm_comps_sep: bool, l2_norm: bool, sign_rotate: bool,
     use_symmetric_norm: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-  """k non-ptrivial *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
+  """k *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
 
   Args:
     senders: Origin of the edges of shape [m].
@@ -249,6 +297,15 @@ def eigv_magnetic_laplacian_numba(
     deg = np.zeros((padded_nodes_size, padded_nodes_size), dtype=np.float64)
     np.fill_diagonal(deg, symmetric_deg)
     laplacian = deg - symmetric_adj * np.exp(theta)
+
+  if q == 0:
+    laplacian_r = np.real(laplacian)
+    assert (laplacian_r == laplacian_r.T).all()
+    # Avoid rounding errors of any sort
+    eigenvalues, eigenvectors = np.linalg.eigh(laplacian_r)
+    eigenvalues = eigenvalues[..., k_excl:k_excl + k]
+    eigenvectors = eigenvectors[..., :, k_excl:k_excl + k]
+    return eigenvalues.real, eigenvectors.astype(np.complex128), laplacian
 
   eigenvalues, eigenvectors = np.linalg.eigh(laplacian)
 
@@ -321,7 +378,7 @@ def eigv_magnetic_laplacian_numba_parallel(
     use_symmetric_norm: bool,
     # ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
 ) -> Tuple[np.ndarray, np.ndarray]:
-  """k non-ptrivial *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
+  """k *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
 
   Args:
     senders: Origin of the edges of shape [b, m].
@@ -384,7 +441,7 @@ def eigv_magnetic_laplacian_numba_batch(
     sign_rotate: bool = False,
     use_symmetric_norm: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-  """k non-ptrivial *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
+  """k *complex* eigenvectors of the smallest k eigenvectors of the magnetic laplacian.
 
   Args:
     senders: Origin of the edges of shape [m].
@@ -431,7 +488,6 @@ def sinusoid_position_encoding(
   """
   freqs = np.arange(0, hidden_size, min_timescale)
   inv_freq = max_timescale**(-freqs / hidden_size)
-  pos_seq = pos_seq[..., ::-1]
   sinusoid_inp = jnp.einsum('bi,j->bij', pos_seq, inv_freq)
   pos_emb = jnp.concatenate(
       [jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)], axis=-1)

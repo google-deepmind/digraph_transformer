@@ -16,18 +16,13 @@
 set -e
 set -x
 
-usage() { echo "Usage: run_training.sh -r <Task root directory> -c <Checkpoint>"; }
-
-while getopts ":r:c:" opt; do
+while getopts ":r:" opt; do
   case ${opt} in
     r )
       TASK_ROOT=$OPTARG
       ;;
-    c )
-      RESTORE_PATH=$OPTARG
-      ;;
     \? )
-      usage
+      echo "Usage: run_sn_dataset_gen.sh -r <Task root directory>"
       ;;
     : )
       echo "Invalid option: $OPTARG requires an argument" 1>&2
@@ -36,26 +31,10 @@ while getopts ":r:c:" opt; do
 done
 shift $((OPTIND -1))
 
-if [ -z "${TASK_ROOT}" ] || [ -z "${RESTORE_PATH}" ]; then
-    usage
-fi
-
 # Get this script's directory.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
-echo "
-These scripts are provided for illustrative purposes. It is not practical for
-actual training since it only uses a single machine, and likely requires
-reducing the batch size and/or model size to fit on a single GPU.
-"
+DATA_ROOT=${TASK_ROOT}
 
-# read -p "Press enter to continue"
-
-MODEL_SEED=42
-DATA_ROOT=${TASK_ROOT}/sorting_network/
-
-python "${SCRIPT_DIR}"/experiment.py \
-    --jaxline_mode="eval" \
-    --config="${SCRIPT_DIR}/config.py:sn,bignn,maglappos,bbs" \
-    --config.restore_path=${RESTORE_PATH} \
-    --config.experiment_kwargs.config.data_root=${DATA_ROOT}
+python "${SCRIPT_DIR}"/script_generate_ogb_code2_np.py \
+    --out_path=${DATA_ROOT}/ogb/ogbg-code2-norev-df --raw_path=${DATA_ROOT}/ogb

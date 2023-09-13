@@ -152,8 +152,10 @@ class ExponentialMovingAverage(hk.Module):
 class LayerNorm(hk.LayerNorm):
   """Wrapper to allow for same interface as BatchNorm."""
 
-  def __init__(self, *args, **kwargs):
-    super().__init__(*args, create_scale=True, create_offset=True, **kwargs)
+  def __init__(self, **kwargs):
+    kwargs.setdefault('create_scale', True)
+    kwargs.setdefault('create_offset', True)
+    super().__init__(**kwargs)
 
   def __call__(self,
                x: Tensor,
@@ -331,15 +333,15 @@ class GraphConvolution(hk.Module):
   """
 
   def __init__(
-      self,
-      forw_update_node_fn: UpdateFn,
-      forw_update_edge_fn: UpdateFn,
-      backw_update_node_fn: Optional[UpdateFn] = None,
-      backw_update_edge_fn: Optional[UpdateFn] = None,
-      aggregate_nodes_fn: jraph.AggregateEdgesToNodesFn = jraph.segment_sum,
-      activation: Callable[[Tensor], Tensor] = jax.nn.relu,
-      add_self_edges: bool = False,
-      name: Optional[str] = None):
+          self,
+          forw_update_node_fn: UpdateFn,
+          forw_update_edge_fn: UpdateFn,
+          backw_update_node_fn: Optional[UpdateFn] = None,
+          backw_update_edge_fn: Optional[UpdateFn] = None,
+          aggregate_nodes_fn: jraph.AggregateEdgesToNodesFn = jraph.segment_sum,
+          activation: Callable[[Tensor], Tensor] = jax.nn.relu,
+          add_self_edges: bool = False,
+          name: Optional[str] = None):
     super().__init__(name)
     self.forw_update_node_fn = forw_update_node_fn
     self.forw_update_edge_fn = forw_update_edge_fn
@@ -374,7 +376,7 @@ class GraphConvolution(hk.Module):
     edges = self.forw_update_edge_fn(orig_edges)
 
     # Calculate the normalization values.
-    count_edges = lambda x: jraph.segment_sum(  # pylint: disable=g-long-lambda
+    def count_edges(x): return jraph.segment_sum(  # pylint: disable=g-long-lambda
         jnp.ones_like(conv_senders), x, total_num_nodes)
     sender_degree = count_edges(conv_senders) + 1.
     receiver_degree = count_edges(conv_receivers) + 1.
@@ -401,7 +403,8 @@ class GraphConvolution(hk.Module):
         dtype=jnp.float32,
         init=hk.initializers.RandomNormal()).astype(transf_nodes.dtype)
 
-    nodes += self.activation(transf_nodes + root_emb) / receiver_degree[:, None]
+    nodes += self.activation(transf_nodes + root_emb) / \
+        receiver_degree[:, None]
 
     # pylint: enable=g-long-lambda
     return graph._replace(nodes=self.activation(nodes))
@@ -474,7 +477,7 @@ class MultiHeadAttention(hk.Module):
   """Multi-headed attention (MHA) module.
 
   This module extends the haiku implementation by optional biases in the
-  linear transofrmrations and dropout_p on the attention matrix.
+  linear transformations and dropout_p on the attention matrix.
 
   Rough sketch:
   - Compute keys (K), queries (Q), and values (V) as projections of inputs.
@@ -592,7 +595,8 @@ class MultiHeadAttention(hk.Module):
     attn_weights = jax.nn.softmax(attn_logits)  # [H, T', T]
 
     if is_training and self.dropout_p > 0:
-      attn_weights = hk.dropout(hk.next_rng_key(), self.dropout_p, attn_weights)
+      attn_weights = hk.dropout(
+        hk.next_rng_key(), self.dropout_p, attn_weights)
 
     # Weight the values by the attention and flatten the head vectors.
     attn = jnp.einsum('...htT,...Thd->...thd', attn_weights, value_heads)
